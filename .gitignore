@@ -1,0 +1,27 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+
+# Datasets and derived artifacts (fetched via scripts/fetch_data.sh)
+data/
+!data/.gitkeep
+
+# Profiling output
+profiles/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+*.qdrep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+compile_commands.json
