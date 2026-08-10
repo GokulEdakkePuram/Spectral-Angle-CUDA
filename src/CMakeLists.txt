@@ -1,5 +1,6 @@
 # Host-only core: data types, ENVI I/O, frame sources, CPU reference SAM.
 add_library(hsi_core
+  types.cpp
   envi.cpp
   frame_source.cpp
   hot_loader.cpp
