@@ -105,6 +105,24 @@ struct Detection {
   float angle_rad = 0;  ///< spectral angle; smaller is a better match
 };
 
+/// Tuning for the thresholding stage.
+struct DetectionParams {
+  /// Pixels whose spectral angle is at or below this are candidates. Radians.
+  float threshold_rad = 0.10f;
+
+  /// Radius of the non-maximum suppression window, in pixels. 0 disables it.
+  ///
+  /// A target bigger than one pixel trips the threshold across its whole
+  /// footprint, so without suppression the output is thousands of pixels
+  /// rather than a handful of targets. Suppression keeps the local best of
+  /// each blob and turns the readback from a mask into a short list.
+  int nms_radius = 2;
+
+  /// Capacity of the output list. Detections beyond this are counted but not
+  /// written, so a saturated frame degrades instead of corrupting memory.
+  int max_detections = 4096;
+};
+
 /// Convert a cube between interleaves. `src` and `dst` must not alias.
 void convert_interleave(const float* src, float* dst, CubeShape shape,
                         Interleave from, Interleave to);

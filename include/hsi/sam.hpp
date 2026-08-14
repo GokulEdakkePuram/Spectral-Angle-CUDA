@@ -45,10 +45,14 @@ void sam_best_cpu(const float* cube_bsq, CubeShape shape, const float* targets,
                   const float* target_norms, int num_targets,
                   float* out_angle_rad, std::int32_t* out_target);
 
-/// Threshold an angle map into a detection list, in raster order.
-std::vector<Detection> threshold_cpu(const float* angle_rad,
-                                     const std::int32_t* target, CubeShape shape,
-                                     float threshold_rad);
+/// Reference thresholding, including non-maximum suppression, in raster order.
+///
+/// Matches the CUDA detector's tie-breaking exactly - a plateau of equal
+/// angles emits the lowest linear index and nothing else - so the two can be
+/// compared element for element rather than only by count.
+std::vector<Detection> detect_cpu(const float* angle_rad,
+                                  const std::int32_t* target, CubeShape shape,
+                                  const DetectionParams& params);
 
 /// Mean spectrum over the pixels where `mask` is non-zero.
 ///
