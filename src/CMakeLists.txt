@@ -10,7 +10,11 @@ target_include_directories(hsi_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_compile_features(hsi_core PUBLIC cxx_std_17)
 
 find_package(Threads REQUIRED)
-target_link_libraries(hsi_core PUBLIC Threads::Threads)
+# zlib decompresses the IDAT stream of the snapshot-mosaic PNGs. It ships with
+# every platform this targets, so it is a cheaper dependency than vendoring an
+# inflate implementation.
+find_package(ZLIB REQUIRED)
+target_link_libraries(hsi_core PUBLIC Threads::Threads PRIVATE ZLIB::ZLIB)
 
 if(NOT HSI_HAVE_CUDA)
   return()
