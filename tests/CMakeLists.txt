@@ -1,0 +1,10 @@
+function(hsi_add_test name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE hsi_core)
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+hsi_add_test(test_sam)
+hsi_add_test(test_io)
+hsi_add_test(test_sources)
