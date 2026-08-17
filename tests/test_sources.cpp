@@ -36,8 +36,8 @@ void test_shape_and_determinism() {
   std::vector<float> fa(options.shape.elements());
   std::vector<float> fb(options.shape.elements());
   FrameMeta ma, mb;
-  CHECK(a->read_into(fa.data(), &ma));
-  CHECK(b->read_into(fb.data(), &mb));
+  CHECK(a->read_into(fa.data(), options.shape.pixels(), &ma));
+  CHECK(b->read_into(fb.data(), options.shape.pixels(), &mb));
 
   // Same seed, same frame - including the noise, which is generated per band
   // so the result cannot depend on how the work was split across threads.
@@ -52,11 +52,11 @@ void test_length_bounds_the_stream() {
 
   std::vector<float> frame(options.shape.elements());
   int produced = 0;
-  while (source->read_into(frame.data(), nullptr)) ++produced;
+  while (source->read_into(frame.data(), options.shape.pixels(), nullptr)) ++produced;
   CHECK(produced == 3);
 
   source->reset();
-  CHECK(source->read_into(frame.data(), nullptr));
+  CHECK(source->read_into(frame.data(), options.shape.pixels(), nullptr));
 }
 
 void test_targets_move_between_frames() {
@@ -64,10 +64,10 @@ void test_targets_move_between_frames() {
   const CubeShape shape = source->shape();
   std::vector<float> frame(shape.elements());
 
-  source->read_into(frame.data(), nullptr);
+  source->read_into(frame.data(), shape.pixels(), nullptr);
   const std::vector<std::uint8_t> first(source->truth_mask(),
                                         source->truth_mask() + shape.pixels());
-  source->read_into(frame.data(), nullptr);
+  source->read_into(frame.data(), shape.pixels(), nullptr);
   const std::uint8_t* second = source->truth_mask();
 
   bool moved = false;
@@ -86,7 +86,7 @@ void test_detector_finds_the_planted_targets() {
   const SpectralLibrary& library = *source->library();
 
   std::vector<float> frame(shape.elements());
-  CHECK(source->read_into(frame.data(), nullptr));
+  CHECK(source->read_into(frame.data(), shape.pixels(), nullptr));
   const std::uint8_t* truth = source->truth_mask();
 
   const std::vector<float> flat = library.flatten();

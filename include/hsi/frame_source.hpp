@@ -33,9 +33,17 @@ class FrameSource {
   /// 0 means unbounded.
   virtual std::uint64_t length() const = 0;
 
-  /// Write the next frame into `dst`, which holds shape().elements() floats.
+  /// Write the next frame into `dst` as BSQ, leaving `plane_stride` elements
+  /// between the start of one band plane and the next. Pass shape().pixels()
+  /// for a tightly packed cube.
+  ///
+  /// The stride is here for the Orin's zero-copy path: the GPU reads the host
+  /// buffer in place, so the buffer has to already carry the padded plane
+  /// stride the kernels need for aligned vector loads. Without it, zero-copy
+  /// would need a repacking pass and stop being zero-copy.
+  ///
   /// Returns false once the stream is exhausted.
-  virtual bool read_into(float* dst, FrameMeta* meta) = 0;
+  virtual bool read_into(float* dst, std::size_t plane_stride, FrameMeta* meta) = 0;
 
   virtual void reset() = 0;
   virtual std::string describe() const = 0;

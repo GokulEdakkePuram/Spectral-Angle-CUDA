@@ -99,13 +99,22 @@ class EnviReplaySource final : public FrameSource {
     return loop_ ? 0 : static_cast<std::uint64_t>(cubes_.size());
   }
 
-  bool read_into(float* dst, FrameMeta* meta) override {
+  bool read_into(float* dst, std::size_t plane_stride, FrameMeta* meta) override {
     if (cursor_ >= cubes_.size()) {
       if (!loop_) return false;
       cursor_ = 0;
     }
     const std::vector<float>& cube = cubes_[cursor_];
-    std::memcpy(dst, cube.data(), cube.size() * sizeof(float));
+    const std::size_t pixels = shape_.pixels();
+    if (plane_stride == pixels) {
+      std::memcpy(dst, cube.data(), cube.size() * sizeof(float));
+    } else {
+      for (int b = 0; b < shape_.bands; ++b) {
+        std::memcpy(dst + static_cast<std::size_t>(b) * plane_stride,
+                    cube.data() + static_cast<std::size_t>(b) * pixels,
+                    pixels * sizeof(float));
+      }
+    }
     if (meta) {
       meta->index = emitted_;
       meta->timestamp_s = static_cast<double>(emitted_) / 30.0;
@@ -185,7 +194,7 @@ class SyntheticSource final : public FrameSource {
   const std::uint8_t* truth_mask() const override { return mask_.data(); }
   const SpectralLibrary* library() const override { return &library_; }
 
-  bool read_into(float* dst, FrameMeta* meta) override {
+  bool read_into(float* dst, std::size_t plane_stride, FrameMeta* meta) override {
     if (opt_.length != 0 && emitted_ >= opt_.length) return false;
 
     const CubeShape shape = opt_.shape;
@@ -198,7 +207,7 @@ class SyntheticSource final : public FrameSource {
       for (int b = b0; b < b1; ++b) {
         std::uint64_t state = noise_state_ + static_cast<std::uint64_t>(b) * 1000003ULL +
                               emitted_ * 7919ULL;
-        float* plane = dst + static_cast<std::size_t>(b) * pixels;
+        float* plane = dst + static_cast<std::size_t>(b) * plane_stride;
         for (std::size_t p = 0; p < pixels; ++p) {
           const float base = background_[material_[p]][static_cast<std::size_t>(b)];
           const float noise = (uniform(state) - 0.5f) * 2.0f * opt_.noise_sigma;
@@ -243,7 +252,7 @@ class SyntheticSource final : public FrameSource {
           const float g = gain_[p];
           for (int b = 0; b < shape.bands; ++b) {
             const float noise = (uniform(state) - 0.5f) * 2.0f * opt_.noise_sigma;
-            dst[static_cast<std::size_t>(b) * pixels + p] =
+            dst[static_cast<std::size_t>(b) * plane_stride + p] =
                 spectrum[static_cast<std::size_t>(b)] * g + noise;
           }
         }

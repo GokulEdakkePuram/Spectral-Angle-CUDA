@@ -227,16 +227,22 @@ class HotSource final : public FrameSource {
     return opt_.loop ? 0 : static_cast<std::uint64_t>(paths_.size());
   }
 
-  bool read_into(float* dst, FrameMeta* meta) override {
+  bool read_into(float* dst, std::size_t plane_stride, FrameMeta* meta) override {
     if (cursor_ >= paths_.size()) {
       if (!opt_.loop) return false;
       cursor_ = 0;
     }
-    if (cursor_ < cache_.size()) {
-      std::memcpy(dst, cache_[cursor_].data(), cache_[cursor_].size() * sizeof(float));
+    const std::vector<float>& cube =
+        (cursor_ < cache_.size()) ? cache_[cursor_] : (streamed_ = load(cursor_).data);
+    const std::size_t pixels = shape_.pixels();
+    if (plane_stride == pixels) {
+      std::memcpy(dst, cube.data(), cube.size() * sizeof(float));
     } else {
-      const HsiFrame frame = load(cursor_);
-      std::memcpy(dst, frame.data.data(), frame.data.size() * sizeof(float));
+      for (int b = 0; b < shape_.bands; ++b) {
+        std::memcpy(dst + static_cast<std::size_t>(b) * plane_stride,
+                    cube.data() + static_cast<std::size_t>(b) * pixels,
+                    pixels * sizeof(float));
+      }
     }
     if (meta) {
       meta->index = emitted_;
@@ -268,6 +274,7 @@ class HotSource final : public FrameSource {
   HotOptions opt_;
   std::vector<std::string> paths_;
   std::vector<std::vector<float>> cache_;
+  mutable std::vector<float> streamed_;  ///< scratch for frames past the cache
   CubeShape shape_;
   std::size_t cursor_ = 0;
   std::uint64_t emitted_ = 0;
