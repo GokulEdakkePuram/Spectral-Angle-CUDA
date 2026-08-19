@@ -224,6 +224,17 @@ class CudaPipeline final : public Pipeline {
     const std::size_t pixels = shape_.pixels();
     const std::size_t cube_elements = bsq_device_elements(shape_);
 
+    // Each run is measured on its own, so a warm-up run does not drag the
+    // percentiles of the run that follows it.
+    latencies_.clear();
+    t_source_.clear();
+    t_upload_.clear();
+    t_sam_.clear();
+    t_detect_.clear();
+    t_download_.clear();
+    t_gpu_.clear();
+    stats_ = PipelineStats{};
+
     const auto wall_begin = std::chrono::steady_clock::now();
     std::uint64_t submitted = 0;
     std::uint64_t completed = 0;

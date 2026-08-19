@@ -5,6 +5,7 @@ add_library(hsi_core
   frame_source.cpp
   hot_loader.cpp
   sam_cpu.cpp
+  spectra_io.cpp
 )
 target_include_directories(hsi_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_compile_features(hsi_core PUBLIC cxx_std_17)
@@ -20,13 +21,16 @@ if(NOT HSI_HAVE_CUDA)
   return()
 endif()
 
+find_package(CUDAToolkit REQUIRED)
+
 # CUDA kernels and the streaming pipeline.
 add_library(hsi_cuda
   sam.cu
   detect.cu
   pipeline.cu
 )
-target_link_libraries(hsi_cuda PUBLIC hsi_core)
+# PUBLIC cudart so plain C++ consumers such as main.cpp get the headers too.
+target_link_libraries(hsi_cuda PUBLIC hsi_core CUDA::cudart)
 set_target_properties(hsi_cuda PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON
