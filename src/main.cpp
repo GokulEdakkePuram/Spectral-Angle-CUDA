@@ -53,6 +53,8 @@ Execution
                                 the GPU rather than the frame generator
   --csv=FILE                    write per-frame timings
   --print-detections=N          print the first N detections of the last frame
+  --dump-angle=FILE             write the last frame's angle map as raw float32
+                                (height*width, raster order) for offline scoring
   --quiet
   --help)");
 }
@@ -194,6 +196,7 @@ int main(int argc, char** argv) {
     options.detection.threshold_rad = args.real("threshold", 0.10f);
     options.detection.nms_radius = args.integer("nms", 2);
     options.detection.max_detections = args.integer("max-detections", 4096);
+    options.return_angle_map = args.has("dump-angle");
 
     std::string error;
     auto pipeline = hsi::Pipeline::create(source.get(), library, options, &error);
@@ -221,6 +224,7 @@ int main(int argc, char** argv) {
 
     // ---- measured run -----------------------------------------------------
     std::vector<hsi::Detection> last_detections;
+    std::vector<float> last_angle_map;
     std::ofstream csv;
     if (args.has("csv")) {
       csv.open(args.str("csv", "timings.csv"));
@@ -230,6 +234,7 @@ int main(int argc, char** argv) {
 
     const auto on_frame = [&](const hsi::FrameResult& result) {
       last_detections = result.detections;
+      if (!result.angle_map.empty()) last_angle_map = result.angle_map;
       if (csv.is_open()) {
         csv << result.meta.index << "," << result.detections_found << ","
             << result.ms_source << "," << result.ms_upload << "," << result.ms_sam
@@ -258,6 +263,16 @@ int main(int argc, char** argv) {
         stats.mean_sam, stats.mean_detect, stats.mean_download, stats.mean_gpu,
         static_cast<unsigned long long>(stats.total_detections),
         stats.frames ? static_cast<double>(stats.total_detections) / stats.frames : 0.0);
+
+    if (args.has("dump-angle") && !last_angle_map.empty()) {
+      const std::string path = args.str("dump-angle", "angle.f32");
+      std::ofstream out(path, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(last_angle_map.data()),
+                static_cast<std::streamsize>(last_angle_map.size() * sizeof(float)));
+      std::printf("\nwrote %zu x float32 angle map to %s (%dx%d)\n",
+                  last_angle_map.size(), path.c_str(), source->shape().height,
+                  source->shape().width);
+    }
 
     const int print = args.integer("print-detections", 0);
     if (print > 0) {

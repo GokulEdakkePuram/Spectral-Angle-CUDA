@@ -47,6 +47,7 @@ struct Slot {
   unsigned int* d_count = nullptr;
   Detection* h_detections = nullptr;  ///< pinned readback
   unsigned int* h_count = nullptr;
+  float* h_angle = nullptr;           ///< pinned, only when scoring offline
 
   cudaEvent_t ev_begin = nullptr, ev_uploaded = nullptr, ev_sam = nullptr,
               ev_detect = nullptr, ev_done = nullptr;
@@ -81,6 +82,7 @@ class CudaPipeline final : public Pipeline {
       if (slot.d_count) cudaFree(slot.d_count);
       if (slot.h_detections) cudaFreeHost(slot.h_detections);
       if (slot.h_count) cudaFreeHost(slot.h_count);
+      if (slot.h_angle) cudaFreeHost(slot.h_angle);
     }
     if (d_targets_) cudaFree(d_targets_);
     if (d_target_norms_) cudaFree(d_target_norms_);
@@ -194,6 +196,11 @@ class CudaPipeline final : public Pipeline {
                    "alloc pinned detection readback");
       HSI_CUDA_TRY(cudaHostAlloc(&slot.h_count, sizeof(unsigned int), cudaHostAllocDefault),
                    "alloc pinned counter readback");
+      if (opt_.return_angle_map) {
+        HSI_CUDA_TRY(cudaHostAlloc(&slot.h_angle, pixels * sizeof(float),
+                                   cudaHostAllocDefault),
+                     "alloc pinned angle map readback");
+      }
 
       const unsigned event_flags = opt_.time_stages ? cudaEventDefault
                                                     : cudaEventDisableTiming;
@@ -309,6 +316,12 @@ class CudaPipeline final : public Pipeline {
                                          sizeof(Detection),
                                      cudaMemcpyDeviceToHost, slot.stream),
                      "read back detections");
+        if (opt_.return_angle_map) {
+          HSI_CUDA_TRY(cudaMemcpyAsync(slot.h_angle, slot.d_angle,
+                                       pixels * sizeof(float),
+                                       cudaMemcpyDeviceToHost, slot.stream),
+                       "read back angle map");
+        }
         HSI_CUDA_TRY(cudaEventRecord(slot.ev_done, slot.stream), "record done");
 
         slot.busy = true;
@@ -375,6 +388,9 @@ class CudaPipeline final : public Pipeline {
     const unsigned kept = std::min<unsigned>(
         result.detections_found, static_cast<unsigned>(opt_.detection.max_detections));
     result.detections.assign(slot.h_detections, slot.h_detections + kept);
+    if (opt_.return_angle_map && slot.h_angle) {
+      result.angle_map.assign(slot.h_angle, slot.h_angle + shape_.pixels());
+    }
 
     if (opt_.time_stages) {
       float ms = 0;

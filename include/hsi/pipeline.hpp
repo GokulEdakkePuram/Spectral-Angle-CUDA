@@ -53,12 +53,24 @@ struct PipelineOptions {
 
   /// Record per-stage CUDA events. Costs a little, so it is opt-in.
   bool time_stages = true;
+
+  /// Also read back the full per-pixel angle map with each frame.
+  ///
+  /// For scoring detection quality offline - ROC curves need every pixel's
+  /// score, not just the ones over threshold. It adds a megabytes-per-frame
+  /// D2H that the real-time path exists to avoid, so it is off by default and
+  /// should stay off when measuring throughput.
+  bool return_angle_map = false;
 };
 
 struct FrameResult {
   FrameMeta meta;
   std::vector<Detection> detections;
   unsigned int detections_found = 0;  ///< may exceed detections.size() if saturated
+
+  /// Per-pixel spectral angle, raster order. Empty unless the pipeline was
+  /// built with return_angle_map.
+  std::vector<float> angle_map;
 
   float ms_source = 0;    ///< host time spent producing the frame
   float ms_upload = 0;    ///< 0 in ZeroCopy mode, by construction
