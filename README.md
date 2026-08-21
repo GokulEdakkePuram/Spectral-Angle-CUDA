@@ -1,6 +1,156 @@
 # HyperSpectral
 
-Real-time Spectral Angle Mapper (SAM) target detection on hyperspectral video,
-built for the Jetson AGX Orin and validated on discrete NVIDIA GPUs.
+Real-time Spectral Angle Mapper (SAM) target detection for hyperspectral video,
+written for the Jetson AGX Orin and validated on discrete NVIDIA GPUs.
 
-Work in progress.
+Given a stream of hyperspectral frames and a library of target signatures, the
+pipeline scores every pixel against every target, thresholds the result and
+returns a compacted list of detections — at video rate, inside a fixed frame
+budget.
+
+## Why the spectral angle
+
+For a pixel spectrum `x` and a reference spectrum `r`:
+
+```
+theta(x, r) = acos( <x, r> / (||x|| * ||r||) )
+```
+
+It is the angle between the two spectra, which makes it invariant to a
+per-pixel multiplicative gain. That invariance is the entire reason to use it.
+Illumination, shadow and viewing geometry scale a spectrum without changing its
+shape, so SAM keeps matching a target through a passing cloud or into shade,
+where a Euclidean distance would lose it. Reflectance is non-negative, so
+angles lie in `[0, pi/2]` and smaller is a better match.
+
+## Layout
+
+```
+include/hsi/     public headers
+src/             core (host) and CUDA kernels, pipeline, CLI
+bench/           kernel-level correctness and throughput harness
+tests/           host-side test suite, no framework dependency
+scripts/         dataset fetch, build, profiling
+docs/            design notes and measured results
+```
+
+## Build
+
+CUDA is optional. Without a toolkit the host-side library and its tests still
+build, which is what makes the ENVI reader, the demosaicer and the CPU
+reference developable on a laptop.
+
+```sh
+scripts/build.sh          # fat binary, Turing through Hopper, plus sm_87
+scripts/build.sh 87       # AGX Orin only, much faster to compile
+cd build && ctest         # host-side tests; adds a GPU check if CUDA was found
+```
+
+## Run
+
+```sh
+# Synthetic video, no data needed - the generator supplies its own signatures.
+build/src/hsi_detect --frames=300
+
+# Real cubes.
+scripts/fetch_hyperblood.sh
+python3 scripts/prepare_hyperblood.py            # signatures + ground truth
+build/src/hsi_detect --source=envi \
+  --envi=data/HyperBlood/data/F_1.hdr \
+  --library=data/hyperblood_targets.csv --threshold=0.08
+
+# Snapshot-mosaic hyperspectral video (HOT-style).
+build/src/hsi_detect --source=hot --hot-dir=<frames/> --mosaic=4 --bands=16 \
+  --library=<targets.csv>
+
+build/src/hsi_detect --help
+```
+
+On the Orin, add `--memory=zerocopy`. On a discrete GPU, do not — see below.
+
+## The kernels
+
+SAM moves `bands * 4` bytes per pixel against roughly two FLOPs per band per
+target. At one target that is 0.5 FLOP/byte, which is far below the ridge point
+of every GPU this runs on: the kernel is bound by DRAM bandwidth, not by
+arithmetic. Every variant is therefore an experiment in moving fewer bytes.
+
+| variant     | what it does                                                      |
+|-------------|-------------------------------------------------------------------|
+| `baseline`  | one thread per pixel, scalar loads, targets from global memory     |
+| `optimized` | `float4` loads, targets broadcast from constant memory, up to eight targets scored per read of the cube |
+| `half`      | as above with the cube in fp16, accumulating in fp32               |
+| `bip`       | the baseline over a BIP cube, to measure the coalescing penalty    |
+
+Three decisions carry most of the performance:
+
+**BSQ, not BIP.** With one thread per pixel and a band-sequential cube,
+neighbouring threads read neighbouring addresses on every band step and the
+loads coalesce. The same kernel over a band-interleaved-by-pixel cube reads at
+a stride of `bands`. `bip` exists so that cost is a measured number rather than
+an assertion, and a device-side tiled transpose is provided for sensors that
+deliver BIP.
+
+**Targets in constant memory.** On any band step every thread in a warp wants
+the same target element. That is the broadcast case the constant bank serves at
+register speed.
+
+**One `acosf` per pixel, not per target.** Candidates are ranked on cosine,
+which is monotonically decreasing in the angle, and converted once at the end.
+
+## Zero-copy on Jetson
+
+The AGX Orin's CPU and GPU share one physical LPDDR5 pool. An H2D copy there
+moves bytes from memory to the same memory — at ~160 MB per frame, the largest
+single cost in the pipeline and pure waste. `--memory=zerocopy` allocates the
+staging buffer pinned and device-mapped and hands the kernels a pointer into
+it, so the copy disappears.
+
+The same flag on a discrete GPU is a trap: every kernel read becomes a PCIe
+transaction. `hsi_detect` prints whether the device is integrated for exactly
+this reason.
+
+Frame sources take a plane stride to write at, so the staging buffer is already
+in the padded layout the kernels need for aligned vector loads. Without that,
+zero-copy would need a repacking pass and would stop being zero-copy.
+
+## Data
+
+**[HyperBlood](https://doi.org/10.5281/zenodo.3984905)** (CC-BY-4.0) — 14
+hyperspectral cubes of blood beside substances chosen to look like it:
+artificial blood, tomato concentrate, beetroot juice, poster paint. 113 usable
+bands, per-pixel ground truth. It is the right dataset here precisely because
+colour cannot separate those classes and the spectral angle can, and because
+the annotations make detection quality measurable rather than eyeballed.
+`scripts/fetch_hyperblood.sh` downloads it.
+
+**HOT-style snapshot mosaic video** — the hyperspectral object tracking
+benchmarks (XIMEA SSM 4×4 VIS, 16 bands over 470–620 nm, 25 fps) are the best
+public hyperspectral *video*, but the archive is behind a request form at
+[hsitracking.com](https://www.hsitracking.com/). The loader is written from the
+published description and tested against synthetic mosaics of the same
+geometry — not against the real files. Check that the first frame's band images
+look like a scene before trusting it, and set `--mosaic`/`--bands` to match the
+set (4×4/16 for VIS, 4×4/15 for RedNIR, 5×5/25 for NIR).
+
+**Synthetic** — a mixed background with target blobs moving through it, at any
+resolution and band count. It exists because the public datasets that ship with
+ground truth are single scenes rather than video, and because throughput has to
+be measured at sensor geometries no dataset happens to provide. It reports the
+mask it stamped, which makes it self-validating.
+
+## Profiling
+
+```sh
+scripts/profile_gpu.sh      # discrete GPU
+scripts/profile_jetson.sh   # AGX Orin
+```
+
+Both check every kernel against the double-precision CPU reference before
+reporting any timing, and both pin clocks first where they can — an unpinned
+run measures the governor rather than the code. The Jetson script additionally
+sets MAXN, logs tegrastats alongside, and prints the peak temperatures reached,
+because a thermal ceiling hit mid-run invalidates every number after it.
+
+Measured results: [docs/results.md](docs/results.md).
+Design notes and the performance model: [docs/design.md](docs/design.md).
