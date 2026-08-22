@@ -112,6 +112,15 @@ EnviHeader parse_envi_header(const std::string& hdr_path) {
     const std::size_t key_begin = (line_start == std::string::npos) ? 0 : line_start + 1;
     const std::string key = lower(trim(text.substr(key_begin, eq - key_begin)));
 
+    // ';' starts a comment line. Real headers carry licence and attribution
+    // blocks up top, and a URL or a sentence in one of them would otherwise
+    // become a field whose name happens to collide with something real.
+    if (!key.empty() && key[0] == ';') {
+      const std::size_t eol = text.find('\n', eq);
+      pos = (eol == std::string::npos) ? text.size() : eol + 1;
+      continue;
+    }
+
     std::size_t value_begin = text.find_first_not_of(" \t", eq + 1);
     if (value_begin == std::string::npos) break;
 

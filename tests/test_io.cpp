@@ -132,7 +132,11 @@ void test_envi_round_trip() {
   }
   {
     std::ofstream out(hdr);
+    // Shaped like a real HyperBlood header: attribution comments above the
+    // fields, an empty braced description, and a wrapped wavelength list.
     out << "ENVI\n"
+        << ";HSI test image, see http://example.org/licenses/by/4.0/\n"
+        << ";samples = 9999 - a comment that looks exactly like a field\n"
         << "description = {\n  a wrapped description with = signs in it\n}\n"
         << "samples = " << width << "\nlines = " << height << "\n"
         << "bands = " << bands << "\nheader offset = 0\n"
@@ -147,6 +151,14 @@ void test_envi_round_trip() {
   CHECK(header.shape == shape);
   CHECK(header.interleave == Interleave::Bil);
   CHECK(header.data_type == 4);
+  // The comment lines must not have become fields. Without the guard,
+  // ";samples = 9999" parses as a field named ";samples" - harmless here, but
+  // it means every sentence with an equals sign in an attribution block ends
+  // up in the map, and one of them eventually collides with something real.
+  CHECK(header.fields.count("samples") == 1);
+  CHECK(header.fields.count(";samples") == 0);
+  for (const auto& entry : header.fields) CHECK(entry.first[0] != ';');
+
   CHECK(header.wavelengths_nm.size() == 4);
   if (header.wavelengths_nm.size() == 4) {
     CHECK_CLOSE(header.wavelengths_nm[0], 400.0, 1e-3);
