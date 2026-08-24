@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The host-side half: ENVI reader, mosaic demosaicer, frame sources and the
+  # CPU reference. All of it builds and runs without a toolkit, which is the
+  # point of making CUDA optional in CMakeLists.
+  host:
+    name: host tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zlib
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Compiling the kernels needs a toolkit but not a GPU, and a kernel that does
+  # not compile is the one failure mode that would otherwise only surface on
+  # rented hardware, an hour and a bill later.
+  cuda:
+    name: cuda build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zlib
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Configure
+        # A single architecture: this job is checking that the code compiles,
+        # and a fat binary would multiply the build time for no extra coverage.
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=87
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Check the binaries exist
+        run: |
+          test -x build/src/hsi_detect
+          test -x build/bench/bench_sam
+          build/src/hsi_detect --help
+
+      - name: Host tests
+        # The GPU tests are skipped by name: the runner has no device, so
+        # bench_sam_correctness cannot run here. It runs on real hardware via
+        # scripts/profile_gpu.sh.
+        run: ctest --test-dir build --output-on-failure -E bench_sam_correctness
