@@ -17,6 +17,12 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 target_link_libraries(hsi_core PUBLIC Threads::Threads PRIVATE ZLIB::ZLIB)
 
+# The reference scorer is host-only on purpose: it runs on a laptop, on a
+# rented GPU box and on the Orin alike, which is what makes it useful as the
+# thing a GPU run gets diffed against.
+add_executable(hsi_score score_main.cpp)
+target_link_libraries(hsi_score PRIVATE hsi_core)
+
 if(NOT HSI_HAVE_CUDA)
   return()
 endif()
