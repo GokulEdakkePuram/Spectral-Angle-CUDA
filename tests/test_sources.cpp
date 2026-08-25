@@ -2,6 +2,9 @@
 // planted its targets, a self-validating end-to-end check of the detector.
 
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include "check.hpp"
@@ -140,9 +143,98 @@ void test_detector_finds_the_planted_targets() {
   CHECK(worst_background > params.threshold_rad);
 }
 
+/// Write a BSQ ENVI pair whose value at (b, y, x) identifies all three, so a
+/// mis-strided or transposed replay cannot pass.
+std::filesystem::path write_cube(const std::filesystem::path& dir,
+                                 const std::string& name, CubeShape shape,
+                                 float offset) {
+  std::vector<float> data(shape.elements());
+  for (int b = 0; b < shape.bands; ++b)
+    for (int y = 0; y < shape.height; ++y)
+      for (int x = 0; x < shape.width; ++x)
+        data[(static_cast<std::size_t>(b) * shape.height + y) * shape.width + x] =
+            offset + b * 100.0f + y * 10.0f + x;
+
+  const std::filesystem::path stem = dir / name;
+  {
+    std::ofstream out(stem.string() + ".float", std::ios::binary);
+    out.write(reinterpret_cast<const char*>(data.data()),
+              static_cast<std::streamsize>(data.size() * sizeof(float)));
+  }
+  {
+    std::ofstream out(stem.string() + ".hdr");
+    out << "ENVI\nsamples = " << shape.width << "\nlines = " << shape.height
+        << "\nbands = " << shape.bands
+        << "\ndata type = 4\ninterleave = bsq\nbyte order = 0\n";
+  }
+  return stem.string() + ".hdr";
+}
+
+void test_envi_replay_cycles_and_honours_stride() {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "hsi_test_replay";
+  fs::create_directories(dir);
+
+  CubeShape shape;
+  shape.height = 3;
+  shape.width = 5;  // not a multiple of 8, so pixels() != a padded stride
+  shape.bands = 4;
+
+  EnviReplayOptions options;
+  options.hdr_paths = {write_cube(dir, "one", shape, 0.0f).string(),
+                       write_cube(dir, "two", shape, 1000.0f).string()};
+  options.loop = true;
+  auto source = make_envi_replay_source(options);
+  CHECK(source->shape() == shape);
+  CHECK(source->interleave() == Interleave::Bsq);
+
+  // Replay with a padded plane stride, the way the pipeline does on Jetson.
+  // Every band plane has to land at its own stride, and the gaps between them
+  // must be left alone rather than written through.
+  const std::size_t stride = shape.pixels() + 3;
+  std::vector<float> buffer(stride * shape.bands, -1.0f);
+
+  for (int round = 0; round < 2; ++round) {
+    for (float offset : {0.0f, 1000.0f}) {
+      CHECK(source->read_into(buffer.data(), stride, nullptr));
+      bool correct = true;
+      for (int b = 0; b < shape.bands; ++b) {
+        for (std::size_t p = 0; p < shape.pixels(); ++p) {
+          const int y = static_cast<int>(p) / shape.width;
+          const int x = static_cast<int>(p) % shape.width;
+          const float want = offset + b * 100.0f + y * 10.0f + x;
+          if (buffer[static_cast<std::size_t>(b) * stride + p] != want) correct = false;
+        }
+        // The padding between planes must still be untouched.
+        for (std::size_t p = shape.pixels(); p < stride; ++p) {
+          if (buffer[static_cast<std::size_t>(b) * stride + p] != -1.0f) correct = false;
+        }
+      }
+      CHECK(correct);
+    }
+  }
+
+  // A cube of a different shape would silently break every preallocated
+  // buffer downstream, so it has to be refused rather than reshaped.
+  CubeShape other = shape;
+  other.bands = 6;
+  EnviReplayOptions bad = options;
+  bad.hdr_paths.push_back(write_cube(dir, "odd", other, 0.0f).string());
+  bool refused = false;
+  try {
+    make_envi_replay_source(bad);
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  CHECK(refused);
+
+  fs::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
+  test_envi_replay_cycles_and_honours_stride();
   test_shape_and_determinism();
   test_length_bounds_the_stream();
   test_targets_move_between_frames();
