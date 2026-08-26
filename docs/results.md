@@ -1,9 +1,13 @@
 # Results
 
-**Status: no measurements yet.** Nothing in this file has been run on real
-hardware. What follows is the ceiling the performance model predicts, the exact
-commands that produce the numbers, and what each one should be checked against.
-Measured tables go in below, replacing the placeholders.
+**Status: no GPU measurements yet.** Nothing here has run on a GPU. The
+performance tables hold the ceiling the model predicts, the commands that
+produce the real numbers, and what each should be checked against.
+
+The correctness and detection-quality sections below *are* measured — on the
+CPU reference, against real HyperBlood data. Those results stand on their own,
+and the GPU is expected to reproduce the angle map to within the tolerances in
+the correctness table.
 
 ## What to run
 
@@ -93,7 +97,21 @@ _To be filled from `kernels_512x512x128_t4.txt`._
 
 ## Correctness
 
-_To be filled from `correctness_*.txt`._
+### Host side, measured
+
+The ENVI read and the CPU reference were cross-checked against an independent
+numpy implementation on a real HyperBlood cube (`A_1`, 520×696×113):
+
+| check | result |
+|-------|--------|
+| BIL→BSQ conversion vs numpy         | bit-exact (max diff 0.0) |
+| angle map vs float64 numpy SAM      | max 1.1e-6 rad, mean 4.2e-8 rad |
+| winning target index                | 0 disagreements in 361 920 pixels |
+
+That fixes the reference the GPU is measured against to real data rather than
+to itself.
+
+### GPU, to be filled from `correctness_*.txt`
 
 Every variant is compared against the double-precision CPU reference. The
 tolerance is 2e-3 rad for the fp32 paths and 5e-3 rad for fp16; both are
@@ -120,26 +138,63 @@ _To be filled from `pipeline.txt` and `memory_mode.txt`._
 
 ## Detection quality on HyperBlood
 
-_To be filled from `scripts/eval_detection.py`._
+Measured on the CPU reference, so these hold regardless of which GPU runs them.
 
 ```sh
 scripts/fetch_hyperblood.sh
 python3 scripts/prepare_hyperblood.py
-build/src/hsi_detect --source=envi \
-  --envi=data/hyperblood_prepared/F_1.hdr \
-  --library=data/hyperblood_targets.csv \
-  --frames=1 --warmup=0 --dump-angle=/tmp/F_1.f32
-python3 scripts/eval_detection.py /tmp/F_1.f32 \
-  data/hyperblood_prepared/F_1_gt.u8 --width=696 --height=520
+
+# --target=blood matters: with a full library the angle map holds the best
+# match over all targets, which is not the same quantity as blood-likeness.
+build/src/hsi_score --cube=data/hyperblood_prepared/A_1.hdr \
+  --library=data/hyperblood_targets.csv --target=blood \
+  --threshold=0.10 --dump-angle=/tmp/A_1_blood.f32
+
+python3 scripts/eval_detection.py /tmp/A_1_blood.f32 \
+  data/hyperblood_prepared/A_1_gt.u8 --width=696 --height=520 --target=1
 ```
 
-The number to look at is not the ROC AUC against background — that is easy.
-It is the per-class mean-angle table: how far blood separates from ketchup,
-tomato concentrate, beetroot juice and the two red paints. Those are the
-classes colour cannot separate, and they are why this dataset was chosen.
+### A_1 — blood, 520×696×113, signature = class mean
 
-| scene | AUC (blood) | mean angle: blood | ketchup | tomato | beetroot | paints |
-|-------|------------:|------------------:|--------:|-------:|---------:|-------:|
+| metric | value |
+|--------|------:|
+| ROC AUC (blood vs rest)     | 0.7026 |
+| precision @ 0.10 rad        | 0.9926 |
+| recall @ 0.10 rad           | 0.1776 |
+| F1 @ 0.10 rad               | 0.3013 |
+| tp / fp / fn                | 2821 / 21 / 13064 |
+
+| class            | pixels | mean angle | min angle |
+|------------------|-------:|-----------:|----------:|
+| blood (target)   |  15885 |     0.2211 |    0.0340 |
+| background       | 338727 |     0.3118 |    0.0834 |
+| uncertain_blood  |   2208 |     0.3525 |    0.0982 |
+
+**Read this as a characterisation, not a score to be improved.** Plain SAM
+against a single global mean signature is high precision and low recall on this
+data: at 0.10 rad it makes 2842 calls and 2821 of them are blood, but it finds
+only 18% of the blood pixels. The reason is in the last table — blood pixels
+scatter 0.22 rad from their own class mean, which is more than the gap between
+the blood and background means. The class is spectrally heterogeneous by
+design: blood of different ages, at different thicknesses, over different
+substrates, with thin regions letting the backing material through.
+
+That is worth stating plainly because it is the honest baseline. A single mean
+endmember is the weakest reasonable signature, and published results on this
+dataset that do much better do so with per-scene signatures, spatial context or
+learned features — none of which this pipeline claims to provide. What it does
+claim is that the angle is computed correctly and fast, and the precision
+figure says the ones it does call are right.
+
+### Still to measure
+
+`A_1` contains only blood; the scenes with the red lookalikes — ketchup, tomato
+concentrate, beetroot juice, poster and acrylic paint — are the interesting
+ones, because those are the classes colour cannot separate. Run the same
+commands against `F_1`, which carries all of them.
+
+| scene | AUC (blood) | blood | ketchup | tomato | beetroot | paints |
+|-------|------------:|------:|--------:|-------:|---------:|-------:|
 | F_1 | | | | | | |
 
 ## Notes on interpretation
