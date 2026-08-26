@@ -29,6 +29,10 @@ void usage() {
 
   --cube=FILE.hdr        ENVI cube to score
   --library=FILE.csv     target spectra
+  --target=NAME          score against this one target only. Needed for a
+                         single-class ROC: with a full library the angle map
+                         holds the best match over all targets, which is a
+                         different quantity from "how blood-like is this pixel"
   --threshold=RAD        detection threshold                        [0.10]
   --nms=N                non-maximum suppression radius, 0 off          [2]
   --dump-angle=FILE      write the angle map as raw float32
@@ -72,7 +76,29 @@ int main(int argc, char** argv) {
 
   try {
     const hsi::HsiFrame frame = hsi::read_envi(get("cube", ""), hsi::Interleave::Bsq);
-    const hsi::SpectralLibrary library = hsi::read_spectra_csv(get("library", ""));
+    hsi::SpectralLibrary library = hsi::read_spectra_csv(get("library", ""));
+
+    // Restricting to one target matters more than it looks. With several
+    // targets the angle map holds min over all of them, so a pixel that is
+    // slightly more ketchup-like than blood-like records the ketchup angle.
+    // Scoring that as "blood-likeness" measures the wrong thing.
+    if (args.count("target")) {
+      const std::string wanted = get("target", "");
+      hsi::SpectralLibrary filtered;
+      for (const hsi::Spectrum& target : library.targets) {
+        if (target.name == wanted) filtered.targets.push_back(target);
+      }
+      if (filtered.targets.empty()) {
+        std::fprintf(stderr, "no target named '%s' in the library. Available:",
+                     wanted.c_str());
+        for (const hsi::Spectrum& target : library.targets) {
+          std::fprintf(stderr, " %s", target.name.c_str());
+        }
+        std::fputc('\n', stderr);
+        return 1;
+      }
+      library = std::move(filtered);
+    }
 
     if (library.bands() != frame.shape.bands) {
       std::fprintf(stderr,
