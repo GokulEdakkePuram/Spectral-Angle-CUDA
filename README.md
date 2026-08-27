@@ -52,12 +52,17 @@ cd build && ctest         # host-side tests; adds a GPU check if CUDA was found
 # Synthetic video, no data needed - the generator supplies its own signatures.
 build/src/hsi_detect --frames=300
 
-# Real cubes.
+# Real cubes. prepare_hyperblood.py writes cleaned 113-band cubes and a
+# matching library; the raw 128-band cubes will not line up with it.
 scripts/fetch_hyperblood.sh
-python3 scripts/prepare_hyperblood.py            # signatures + ground truth
+python3 scripts/prepare_hyperblood.py
 build/src/hsi_detect --source=envi \
-  --envi=data/HyperBlood/data/F_1.hdr \
-  --library=data/hyperblood_targets.csv --threshold=0.08
+  --envi=data/hyperblood_prepared/F_1.hdr \
+  --library=data/hyperblood_targets.csv --threshold=0.10
+
+# CPU reference scorer - no GPU needed, and what a GPU run gets diffed against.
+build/src/hsi_score --cube=data/hyperblood_prepared/F_1.hdr \
+  --library=data/hyperblood_targets.csv --target=blood --dump-angle=/tmp/F_1.f32
 
 # Snapshot-mosaic hyperspectral video (HOT-style).
 build/src/hsi_detect --source=hot --hot-dir=<frames/> --mosaic=4 --bands=16 \
@@ -138,6 +143,29 @@ resolution and band count. It exists because the public datasets that ship with
 ground truth are single scenes rather than video, and because throughput has to
 be measured at sensor geometries no dataset happens to provide. It reports the
 mask it stamped, which makes it self-validating.
+
+## Does it work
+
+On HyperBlood's `F_1` — blood beside ketchup, artificial blood, beetroot juice,
+poster paint, tomato concentrate and acrylic paint, all red — with the target
+signature taken from that scene:
+
+| | |
+|---|---|
+| ROC AUC (blood vs rest) | 0.9945 |
+| precision @ 0.10 rad | 1.0000 (0 false positives in 320 174 negatives) |
+| recall @ 0.10 rad | 0.7055 |
+
+Blood averages 0.0916 rad from the signature; the closest single pixel of the
+nearest confuser, beetroot juice, sits at 0.1623. That margin is the whole
+argument for using the spectral angle.
+
+The caveat, measured rather than assumed: **the ranking transfers between
+scenes but the threshold does not.** Carrying `A_1`'s signature over to `F_1`
+keeps AUC at 0.88 but drops precision at a fixed 0.10 rad from 1.00 to 0.51. A
+deployed detector needs its threshold set per scene, or derived from the
+frame's own angle distribution. Full tables in
+[docs/results.md](docs/results.md).
 
 ## Profiling
 
