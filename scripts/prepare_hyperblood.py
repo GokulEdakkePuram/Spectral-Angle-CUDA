@@ -34,11 +34,29 @@ import sys
 
 import numpy as np
 
-# Published cleaning for this dataset: sensor-edge bands plus a known artefact
-# around index 48-50. 128 - 15 = 113.
+# The dataset's own cleaning, reproduced from src/ds_load.py in the archive so
+# these cubes stay comparable to every published result on it.
+#
+# Two things get removed. Fifteen noisy bands - five at the bottom of the
+# sensor's response, seven at the top, and three around index 48 - leaving 113.
+# And image row 445, which is a damaged sensor line: left in, it is a stripe of
+# nonsense spectra straight across the scene, and a detector will happily
+# report it.
+#
+# F_2k is the exception on both counts. It was acquired with 116 bands rather
+# than 128, and its sensor line is not damaged.
 NOISY_BANDS = np.array(
     [0, 1, 2, 3, 4, 48, 49, 50, 121, 122, 123, 124, 125, 126, 127]
 )
+DAMAGED_ROW = 445
+SHORT_SCENE = "F_2k"
+
+
+def good_band_indices(bands, scene):
+    """Band indices to keep, matching the dataset's get_good_indices()."""
+    if scene == SHORT_SCENE:
+        return np.delete(np.arange(bands), [43, 44, 45])
+    return np.delete(np.arange(bands)[5:-7], [43, 44, 45])
 
 CLASS_NAMES = {
     0: "background",
@@ -154,6 +172,11 @@ def main():
         action="store_true",
         help="skip band cleaning and keep all 128 bands",
     )
+    parser.add_argument(
+        "--keep-damaged-row",
+        action="store_true",
+        help="keep image row 445, the damaged sensor line",
+    )
     args = parser.parse_args()
 
     root = args.data_dir / "HyperBlood"
@@ -192,10 +215,26 @@ def main():
             continue
 
         if not args.keep_noisy_bands:
-            keep = np.setdiff1d(np.arange(cube.shape[0]), NOISY_BANDS)
+            keep = good_band_indices(cube.shape[0], scene)
+            if len(keep) != 113:
+                print(
+                    f"{scene}: cleaning gave {len(keep)} bands, expected 113",
+                    file=sys.stderr,
+                )
             cube = cube[keep]
-            if wavelengths is not None and len(wavelengths) == len(keep) + len(NOISY_BANDS):
+            if wavelengths is not None and len(wavelengths) > len(keep):
                 wavelengths = wavelengths[keep]
+
+        # Independent of band cleaning: the damaged row has to come out of the
+        # cube and the annotation together, or every label below it shifts up
+        # by one line.
+        if (
+            not args.keep_damaged_row
+            and scene != SHORT_SCENE
+            and cube.shape[1] > DAMAGED_ROW
+        ):
+            cube = np.delete(cube, DAMAGED_ROW, axis=1)
+            gt = np.delete(gt, DAMAGED_ROW, axis=0)
         if wavelengths_out is None:
             wavelengths_out = wavelengths
 

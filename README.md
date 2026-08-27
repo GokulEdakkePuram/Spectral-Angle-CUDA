@@ -153,19 +153,25 @@ signature taken from that scene:
 | | |
 |---|---|
 | ROC AUC (blood vs rest) | 0.9945 |
-| precision @ 0.10 rad | 1.0000 (0 false positives in 320 174 negatives) |
-| recall @ 0.10 rad | 0.7055 |
+| precision @ 0.10 rad | 1.0000 — **0 false positives in 320 000 negatives** |
+| recall @ 0.10 rad | 0.7073 |
 
 Blood averages 0.0916 rad from the signature; the closest single pixel of the
 nearest confuser, beetroot juice, sits at 0.1623. That margin is the whole
 argument for using the spectral angle.
 
-The caveat, measured rather than assumed: **the ranking transfers between
-scenes but the threshold does not.** Carrying `A_1`'s signature over to `F_1`
-keeps AUC at 0.88 but drops precision at a fixed 0.10 rad from 1.00 to 0.51. A
-deployed detector needs its threshold set per scene, or derived from the
-frame's own angle distribution. Full tables in
-[docs/results.md](docs/results.md).
+Across all 14 scenes, mean AUC is 0.879 with an on-scene signature and 0.798
+with one global signature. The split that matters is not the signature but the
+scene: the controlled-background "frame" images reach 0.98–0.999 AUC at ~0.9
+recall, while the cluttered mock-up scenes sit at 0.70–0.81, because SAM has no
+spatial context to fall back on when the background overlaps the target in
+spectral direction.
+
+The operational caveat, measured rather than assumed: **ranking transfers
+between scenes, the threshold does not.** Precision at a fixed 0.10 rad swings
+from 1.00 to 0.004 across scenes with the same library. A deployed detector
+needs its threshold set per scene, or derived from the frame's own angle
+distribution. Full tables in [docs/results.md](docs/results.md).
 
 ## Profiling
 

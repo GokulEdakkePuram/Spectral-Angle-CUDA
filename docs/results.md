@@ -100,13 +100,13 @@ _To be filled from `kernels_512x512x128_t4.txt`._
 ### Host side, measured
 
 The ENVI read and the CPU reference were cross-checked against an independent
-numpy implementation on a real HyperBlood cube (`A_1`, 520×696×113):
+numpy implementation on real HyperBlood cubes:
 
 | check | result |
 |-------|--------|
-| BIL→BSQ conversion vs numpy         | bit-exact (max diff 0.0) |
-| angle map vs float64 numpy SAM      | max 1.1e-6 rad, mean 4.2e-8 rad |
-| winning target index                | 0 disagreements in 361 920 pixels |
+| BIL→BSQ conversion vs numpy    | bit-exact (max diff 0.0) |
+| angle map vs float64 numpy SAM | max 6.5e-7 rad, mean 1.1e-7 rad |
+| winning target index           | 0 disagreements in 361 224 pixels |
 
 That fixes the reference the GPU is measured against to real data rather than
 to itself.
@@ -154,78 +154,90 @@ python3 scripts/eval_detection.py /tmp/A_1_blood.f32 \
   data/hyperblood_prepared/A_1_gt.u8 --width=696 --height=520 --target=1
 ```
 
-### F_1 — blood against five red lookalikes
+All 14 scenes, blood as the target, threshold 0.10 rad. Two signature regimes,
+because they answer different questions:
 
-The scene worth caring about. It carries blood alongside ketchup, artificial
-blood, beetroot juice, poster paint, tomato concentrate and acrylic paint —
-all red, none of them separable by colour.
+* **on-scene** — the signature is the mean of that scene's own labelled blood.
+  This is the operator-in-the-loop mode: mark target pixels in the current
+  frame, then detect.
+* **global** — one signature averaged over all 14 scenes, carried in from
+  elsewhere. This is the ship-it-in-a-config-file mode.
 
-Signature = mean of that scene's labelled blood pixels, threshold 0.10 rad:
+| scene | on-scene AUC | prec | recall | global AUC | prec | recall |
+|-------|-------------:|-----:|-------:|-----------:|-----:|-------:|
+| A_1   | 0.7019 | 0.9924 | 0.1804 | 0.5979 | 0.8097 | 0.2355 |
+| B_1   | 0.7662 | 0.8791 | 0.0662 | 0.5516 | 0.6893 | 0.0530 |
+| C_1   | 0.7891 | 0.0826 | 0.0036 | 0.7218 | 0.8006 | 0.1315 |
+| D_1   | 0.8104 | 0.9027 | 0.7274 | 0.9979 | 0.9997 | 0.1446 |
+| E_1   | 0.7296 | 0.5793 | 0.0813 | 0.6894 | 0.3385 | 0.0590 |
+| E_7   | 0.8096 | 0.2083 | 0.1009 | 0.6020 | 0.0039 | 0.0013 |
+| E_21  | 0.7426 | 0.0501 | 0.0613 | 0.6721 | 0.0227 | 0.0051 |
+| **F_1**  | **0.9945** | **1.0000** | 0.7073 | 0.6940 | 0.3351 | 0.0388 |
+| F_1a  | 0.9930 | 0.6865 | 0.9438 | 0.9586 | 0.7250 | 0.2864 |
+| F_1s  | 0.9964 | 0.8660 | 0.8790 | 0.9805 | 0.5377 | 0.2038 |
+| F_2   | 0.9991 | 0.9275 | 0.9774 | 0.9412 | 0.5559 | 0.1913 |
+| F_7   | 0.9838 | 0.9655 | 0.9076 | 0.9301 | 0.5992 | 0.1709 |
+| F_21  | 0.9979 | 0.9847 | 0.9380 | 0.9191 | 0.3439 | 0.0694 |
+| F_2k  | 0.9959 | 0.9161 | 0.9517 | 0.9122 | 0.1609 | 0.0431 |
+| **mean** | **0.8793** | | | **0.7977** | | |
+
+### What the table says
+
+**The scene split matters more than the signature.** The `F_*` scenes — the
+"frame" images, blood on a controlled background — reach 0.98–0.999 AUC with
+recall around 0.9 when calibrated on scene. The `A`–`E` mock-up scenes, with
+cluttered natural backgrounds, sit at 0.70–0.81. Same kernel, same signature
+procedure; the difference is entirely how much the background overlaps the
+target in spectral direction. SAM has no spatial context to fall back on when
+it does.
+
+**On-scene calibration is worth about 0.08 AUC on average**, and much more than
+that at a fixed operating point. F_1 goes from 0.694 AUC with the global
+signature to 0.9945 with its own, and its precision at 0.10 rad from 0.34 to
+1.00.
+
+### F_1 in detail — blood against five red lookalikes
+
+The case this dataset exists for: blood alongside ketchup, artificial blood,
+beetroot juice, poster paint, tomato concentrate and acrylic paint, all red,
+none separable by colour. On-scene signature, 0.10 rad:
 
 | metric | value |
 |--------|------:|
-| ROC AUC (blood vs rest) | 0.9945 |
-| precision               | 1.0000 |
-| recall                  | 0.7055 |
-| F1                      | 0.8273 |
-| tp / fp / fn            | 20934 / **0** / 8737 |
+| ROC AUC | 0.9945 |
+| precision | 1.0000 — **0 false positives in 320 000 negatives** |
+| recall | 0.7073 |
 
-| class              | pixels | mean angle | min angle |
-|--------------------|-------:|-----------:|----------:|
-| **blood** (target) |  29671 | **0.0916** | 0.0216 |
-| beetroot_juice     |  13986 |     0.1857 | 0.1623 |
-| poster_paint       |   9333 |     0.2062 | 0.1724 |
-| acrylic_paint      |   8328 |     0.2144 | 0.1120 |
-| ketchup            |  14177 |     0.2374 | 0.1901 |
-| artificial_blood   |   9603 |     0.2795 | 0.1865 |
-| uncertain_blood    |    581 |     0.3220 | 0.1834 |
-| tomato_concentrate |   8996 |     0.3744 | 0.2324 |
-| background         | 255170 |     0.4573 | 0.1606 |
+| class | mean angle | min angle |
+|-------|-----------:|----------:|
+| **blood** (target) | **0.0916** | 0.0216 |
+| beetroot_juice     | 0.1857 | 0.1623 |
+| poster_paint       | 0.2062 | 0.1724 |
+| acrylic_paint      | 0.2144 | 0.1120 |
+| ketchup            | 0.2374 | 0.1901 |
+| artificial_blood   | 0.2795 | 0.1865 |
+| tomato_concentrate | 0.3744 | 0.2324 |
+| background         | 0.4573 | 0.1606 |
 
-Zero false positives across 320 174 negative pixels, of which 54 427 are the
-red lookalikes. The margin is not luck: blood averages 0.0916 rad while the
-*closest single pixel* of the nearest confuser, beetroot juice, sits at 0.1623
-— above the threshold. This is the case the spectral angle exists for, and it
-is the result the rest of the project is built to compute quickly.
+The margin is not luck: blood averages 0.0916 rad while the *closest single
+pixel* of the nearest confuser, beetroot juice, sits at 0.1623 — above the
+threshold. That separation is the entire argument for the spectral angle, and
+it is what the rest of this project exists to compute quickly.
 
-### Cross-scene: the threshold does not transfer
+### The operational caveat
 
-The table above uses a signature taken from the same scene, which is a fair
-operating mode — an operator marking target pixels in the current frame — but
-it is not the same as a signature carried in from elsewhere. Both were run:
-
-| signature from | scored on | AUC | precision @0.10 | recall @0.10 |
-|----------------|-----------|----:|----------------:|-------------:|
-| F_1            | F_1       | 0.9945 | 1.0000 | 0.7055 |
-| A_1 + F_1      | F_1       | 0.9935 | 0.9999 | 0.4458 |
-| A_1            | F_1       | 0.8816 | 0.5115 | 0.2168 |
-| F_1            | A_1       | 0.8236 | 1.0000 | 0.0588 |
-| A_1 + F_1      | A_1       | 0.7909 | 1.0000 | 0.0540 |
-| A_1            | A_1       | 0.7026 | 0.9926 | 0.1776 |
-
-Two things fall out of this, and both are operational rather than numerical.
-
-**Ranking transfers; the threshold does not.** AUC stays between 0.79 and 0.99
-across every combination, so the angle keeps ordering blood ahead of everything
-else even with a foreign signature. But precision at a *fixed* 0.10 rad
-collapses from 1.00 to 0.51 when A_1's signature is used on F_1. A deployed
-detector therefore cannot ship one constant threshold with one library — it
-needs the threshold set per scene, or an adaptive one derived from the angle
-distribution of the frame.
-
-**A_1 is hard for a reason that is not the algorithm's.** Note that A_1 scores
-*better* with F_1's signature (0.82) than with its own (0.70). Its blood
-pixels scatter 0.22 rad from their own class mean — wider than the gap between
-its blood and background means — because the class spans different ages,
-thicknesses and substrates, with thin regions letting the backing through. A
-single mean endmember is simply a poor summary of that class, and F_1's
-fresher blood happens to give a better-conditioned one.
+Ranking transfers between scenes; the threshold does not. Global-signature AUC
+stays respectable almost everywhere, so the angle keeps ordering blood ahead of
+the rest — but precision at a *fixed* 0.10 rad swings from 1.00 to 0.004
+depending on the scene. A deployed detector cannot ship one constant threshold
+with one library. It needs the threshold set per scene, or derived from the
+angle distribution of the frame itself.
 
 None of this is a claim about the state of the art. A single mean endmember is
-the weakest reasonable signature, and published results on this dataset that do
-better use per-scene signatures, spatial context or learned features — none of
+the weakest reasonable signature, and published results that do better on this
+dataset use per-scene signatures, spatial context or learned features — none of
 which this pipeline provides. What it claims is that the angle is computed
-correctly and fast, and that where the signature fits, the detections are
+correctly and fast, and that where the signature fits, the calls it makes are
 right.
 
 ## Notes on interpretation
