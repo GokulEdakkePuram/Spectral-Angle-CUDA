@@ -1,7 +1,12 @@
-# HyperSpectral
+# spectral-angle-cuda
+
+[![ci](https://github.com/GokulEdakkePuram/spectral-angle-cuda/actions/workflows/ci.yml/badge.svg)](https://github.com/GokulEdakkePuram/spectral-angle-cuda/actions/workflows/ci.yml)
 
 Real-time Spectral Angle Mapper (SAM) target detection for hyperspectral video,
 written for the Jetson AGX Orin and validated on discrete NVIDIA GPUs.
+
+Not to be confused with Segment Anything — SAM here is the spectral angle
+mapper, a classical hyperspectral target detection measure.
 
 Given a stream of hyperspectral frames and a library of target signatures, the
 pipeline scores every pixel against every target, thresholds the result and
@@ -188,3 +193,16 @@ because a thermal ceiling hit mid-run invalidates every number after it.
 
 Measured results: [docs/results.md](docs/results.md).
 Design notes and the performance model: [docs/design.md](docs/design.md).
+
+## License
+
+The code is MIT — see [LICENSE](LICENSE).
+
+The datasets are not redistributed here; the scripts download them from the
+original sources, and their own terms apply:
+
+* **HyperBlood** — CC-BY-4.0. Romaszewski, Głomb, Cholewa and Sochan, Institute
+  of Theoretical and Applied Informatics, Polish Academy of Sciences.
+  [doi:10.5281/zenodo.3984905](https://doi.org/10.5281/zenodo.3984905)
+* **HOT** — obtained separately under the terms at
+  [hsitracking.com](https://www.hsitracking.com/). No HOT data is included.

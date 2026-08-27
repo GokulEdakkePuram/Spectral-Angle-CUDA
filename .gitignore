@@ -3,9 +3,9 @@ build/
 build-*/
 cmake-build-*/
 
-# Datasets and derived artifacts (fetched via scripts/fetch_data.sh)
+# Datasets and everything derived from them (see scripts/fetch_hyperblood.sh
+# and scripts/prepare_hyperblood.py). HyperBlood alone is 2.3 GB.
 data/
-!data/.gitkeep
 
 # Profiling output
 profiles/
@@ -13,6 +13,10 @@ profiles/
 *.sqlite
 *.ncu-rep
 *.qdrep
+
+# Dumped angle and target maps from --dump-angle / --dump-target
+*.f32
+*.i32
 
 # Python
 __pycache__/
