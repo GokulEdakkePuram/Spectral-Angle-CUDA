@@ -1,10 +1,16 @@
 # Results
 
-Measured on an **RTX 3090** (sm_86, 82 SMs, 936.1 GB/s peak, CUDA 13.0, driver
-580.142) in a rented container, and on the CPU reference for detection quality.
+Kernel and pipeline figures measured on an **RTX 3090** (sm_86, 82 SMs,
+936.1 GB/s peak, CUDA 13.0, driver 580.142) in a rented container. Detection
+quality measured on the CPU reference against real HyperBlood data.
 
-**Not yet measured on the Orin.** Everything about zero-copy and unified memory
-below is still a prediction.
+Every kernel figure is the median of five timed passes taken after the clock
+has settled, with the peak-to-peak spread and the SM clock under load beside
+it. That instrumentation matters more than it sounds — see
+[Reading these numbers](#reading-these-numbers).
+
+**Not measured on the Orin.** Everything about zero-copy and unified memory is
+still a prediction.
 
 ## What to run
 
@@ -14,15 +20,30 @@ scripts/profile_gpu.sh           # discrete GPU
 scripts/profile_jetson.sh        # AGX Orin
 ```
 
-Both write a timestamped directory under `profiles/`. Correctness runs first
-and gates everything after it.
+Correctness runs first and gates everything after it.
+
+## Reading these numbers
+
+The card is capped at **220 W of a 350 W board**. Under load its SM clock
+collapses from 1695 MHz to as little as 285 MHz while the memory clock never
+moves off 9501 MHz. Two consequences run through everything below.
+
+**The SM clock column is a diagnostic, not a footnote.** Across every
+measurement taken, clock and achieved bandwidth are *inversely* correlated:
+
+| SM clock under load | achieved bandwidth | what it means |
+|---------------------|-------------------|---------------|
+| 285–870 MHz  | 80–86% of peak | memory-bound; the GPU spends its power budget on DRAM |
+| 1300–1860 MHz | 14–73% of peak | SM-bound; DRAM is idle enough that clock goes to the SM instead |
+
+A kernel running at 1800 MHz and 26% of peak is not fast, it is stalled.
+
+**Percent of peak can exceed 100%.** It divides useful bytes by DRAM peak, and
+some of those bytes come from L2 rather than DRAM. See the 16-band row.
 
 ## Correctness
 
 ### GPU vs the CPU reference
-
-All four variants, both shapes, on the RTX 3090. Tolerance is 2e-3 rad for the
-fp32 paths and 5e-3 for fp16.
 
 | variant | 96×128×24, 4 targets | 520×696×113, 8 targets | verdict |
 |---------|---------------------:|-----------------------:|---------|
@@ -31,18 +52,17 @@ fp32 paths and 5e-3 for fp16.
 | `half`      | 1.72e-04 | 1.27e-04 | PASS |
 | `bip`       | 1.80e-05 | 5.80e-05 | PASS |
 
-Zero significant label mismatches in every case. The fp32 paths land ~35×
-inside their tolerance and fp16 ~40× inside its own, so the thresholds are not
-doing any work here — the kernels simply agree with double precision.
-
-fp16 is better than expected. Accumulating in fp32 while storing in fp16 costs
-about 1e-4 rad, which is three orders of magnitude below any sensible detection
+Tolerance is 2e-3 rad for the fp32 paths and 5e-3 for fp16. Zero significant
+label mismatches anywhere. The fp32 paths land ~35× inside tolerance and fp16
+~40× inside its own, so the thresholds are not doing any work — the kernels
+simply agree with double precision. Accumulating in fp32 while storing in fp16
+costs about 1e-4 rad, three orders of magnitude below any usable detection
 threshold.
 
 ### Host side
 
-The ENVI read and the CPU reference were cross-checked against an independent
-numpy implementation on real HyperBlood cubes:
+Cross-checked against an independent numpy implementation on real HyperBlood
+cubes:
 
 | check | result |
 |-------|--------|
@@ -52,61 +72,124 @@ numpy implementation on real HyperBlood cubes:
 
 ## Kernel throughput
 
-512×512×128 (134.2 MB), 4 targets, RTX 3090:
+512×512×128 (134.2 MB), 4 targets:
 
-| variant | ms | GB/s | % of peak | vs baseline |
-|---------|---:|-----:|----------:|------------:|
-| `baseline`  | 0.650 | 825.5 | 88% | 1.00× |
-| `optimized` | 0.164 | 819.3 | 88% | **3.97×** |
-| `half`      | 0.098 | 684.3 | 73% | **6.63×** |
-| `bip`       | 1.836 | 292.4 | 31% | 0.35× |
+| variant | ms | GB/s | % of peak | vs baseline | spread | SM MHz |
+|---------|---:|-----:|----------:|------------:|-------:|-------:|
+| `baseline`  | 0.665 | 807.1 | 86% | 1.00× | 5.5% |  945 |
+| `optimized` | 0.174 | 771.4 | 82% | **3.82×** | 2.9% | 1140 |
+| `half`      | 0.098 | 682.5 | 73% | **6.77×** | 0.1% | 1440 |
+| `bip`       | 1.820 | 295.1 | 32% | 0.37× | 1.0% | 1560 |
 
-BIP→BSQ transpose: 0.421 ms at 636.9 GB/s counting read and write.
+BIP→BSQ transpose: 0.429 ms at 625.8 GB/s counting read and write.
 
 ### Scaling with target count
 
-The number that decides whether amortising the cube read across targets works.
-`optimized` and `half` hold roughly constant while `baseline` scales linearly,
-because its target loop is outermost and re-reads the cube every time.
+At 128 bands. This is where the design either pays off or does not.
 
-| targets | baseline | optimized | half | opt speedup | opt % of peak |
-|--------:|---------:|----------:|-----:|------------:|--------------:|
-|  1 | 0.161 | 0.158 | 0.095 | 1.02× | 91% |
-|  2 | 0.319 | 0.161 | 0.098 | 1.99× | 89% |
-|  4 | 0.653 | 0.164 | 0.098 | 3.98× | 87% |
-|  8 | 1.317 | 0.277 | 0.192 | 4.76× | **52%** |
-| 16 | 2.642 | 0.531 | 0.384 | 4.97× | **54%** |
+| targets | baseline | optimized | half | opt speedup | opt % peak | opt SM MHz |
+|--------:|---------:|----------:|-----:|------------:|-----------:|-----------:|
+|  1 | 0.174 | 0.168 | 0.095 | 1.04× | 85% |  390 |
+|  2 | 0.352 | 0.168 | 0.096 | 2.10× | 85% |  705 |
+|  4 | 0.708 | 0.171 | 0.098 | 4.14× | 84% |  765 |
+|  8 | 1.386 | 0.244 | 0.203 | 5.67× | **59%** | **1440** |
+| 16 | 2.843 | 0.481 | 0.406 | 5.91× | **60%** | **1455** |
+
+`optimized` is flat at 84–85% of peak and 390–765 MHz through four targets —
+textbook memory-bound. At eight it drops to 59% *and the clock jumps to
+1440 MHz*. It has stopped being memory-bound.
 
 ### Scaling with band count
 
-| bands | MB | baseline | optimized | half | bip | opt % of peak |
-|------:|---:|---------:|----------:|-----:|----:|--------------:|
-|  16 |  16.8 | 0.037 | 0.029 | 0.024 | 0.065 | 62% |
-|  32 |  33.6 | 0.158 | 0.047 | 0.035 | 0.331 | 76% |
-|  64 |  67.1 | 0.318 | 0.088 | 0.059 | 0.871 | 82% |
-| 113 | 118.5 | 0.575 | 0.149 | 0.093 | 2.201 | 85% |
-| 128 | 134.2 | 0.653 | 0.164 | 0.099 | 1.813 | 87% |
-| 224 | 234.9 | 1.166 | 0.278 | 0.158 | 7.133 | 90% |
+4 targets:
 
-At 16 bands `baseline` reports **193% of peak**, which looks like a broken
-measurement and is not one. Holding iterations at 100, 1000 and 5000 gives
-183%, 179% and 172% — it does not amortise away, so it is not launch overhead.
+| bands | MB | baseline | optimized | half | bip | opt % peak |
+|------:|---:|---------:|----------:|-----:|----:|-----------:|
+|  16 |  16.8 | 0.044 | 0.030 | 0.026 | 0.073 | 59% |
+|  32 |  33.6 | 0.170 | 0.050 | 0.038 | 0.377 | 71% |
+|  64 |  67.1 | 0.345 | 0.089 | 0.058 | 0.875 | 80% |
+| 113 | 118.5 | 0.611 | 0.150 | 0.088 | 2.164 | 84% |
+| 128 | 134.2 | 0.699 | 0.170 | 0.098 | 1.825 | 85% |
+| 224 | 234.9 | 1.232 | 0.315 | 0.167 | 7.020 | 80% |
 
-It is L2 reuse, and it is real. `baseline`'s target loop is outermost *per
-thread*, so each thread re-reads its own spectrum `num_targets` times back to
-back. The working set of one resident wave is roughly
-`126k threads × bands × 4 B`, which at 16 bands is ~8 MB against the 3090's
-6 MB L2 — so three of the four passes largely hit cache. At 128 bands the same
-figure is 64 MB, nothing is retained, and the number falls back to true DRAM
-bandwidth.
+`baseline` at 16 bands reports **164% of peak**, which is real rather than
+broken. Its target loop is outermost *per thread*, so each thread re-reads its
+own spectrum four times back to back; the resident working set
+(`~126k threads × 16 bands × 4 B ≈ 8 MB`) is close enough to the 6 MB L2 that
+most of the re-reads hit cache. At 128 bands the same figure is 64 MB, nothing
+is retained, and the number falls back to true DRAM bandwidth.
 
-So the *time* is trustworthy; it is the `% of peak` column that misleads,
-because it divides useful bytes by DRAM peak while some of those bytes never
-came from DRAM. Read that column as meaningless wherever
-`resident_threads × bands × 4 B` approaches L2 size, and note this is also why
-`optimized` looks poor at 16 bands (62%): it reads the cube once, so there is
-no redundancy for L2 to absorb, and 0.029 ms is too little work to saturate
-anything.
+`bip` at 16 bands reaches **98% of peak**, its best result anywhere, for the
+same kind of reason: a 16-band spectrum is 64 bytes, exactly one cache line, so
+the strided access costs nothing. It degrades monotonically as the spectrum
+spans more lines — 38% at 32 bands, 23% at 113, 14% at 224.
+
+## Where the optimized kernel stops being memory-bound
+
+The inner loop issues `TT` constant-memory reads per vector load, where `TT` is
+the targets scored in one pass and the load covers `PPT` pixels. Varying `PPT`
+varies that ratio directly. At 128 bands:
+
+| targets | const reads per 16-byte load | px=2 | px=4 | px=8 |
+|--------:|-----------------------------:|-----:|-----:|-----:|
+|  1 | 0.5 – 2 | 81% | 83% | 83% |
+|  2 | 1 – 4   | 79% | 82% | 81% |
+|  4 | 2 – 8   | 76% | 81% | 79% |
+|  8 | 4 – 16  | **26%** | **60%** | 67% |
+| 16 | 4 – 16  | **26%** | **59%** | 66% |
+
+Collecting by ratio rather than by configuration:
+
+| const reads per 16 B | achieved | SM clock |
+|---------------------:|---------:|---------:|
+| ≤ 4  | 76–85% |  570–1200 MHz |
+| 8    | 59–60% |  1455 MHz |
+| 16   | 26%    |  1860 MHz |
+
+The knee sits between 4 and 8, and the clock rises exactly as the bandwidth
+falls. **Keeping constant-memory reads at or below four per 16-byte load keeps
+the kernel memory-bound**; past that it becomes constant-cache-bound and the
+DRAM goes idle. Eight pixels per thread at eight targets restores the 4:1 ratio
+and recovers 7 points (60% → 67%), which is consistent but not a full recovery.
+
+Confirming the mechanism needs `ncu`, and the rented container blocked
+performance counters (`ERR_NVGPUCTRPERM`).
+
+### The band-count notch
+
+On top of the ratio effect, at eight targets the geometries where **the band
+count is a multiple of 128** lose a further ~15 points:
+
+| bands | 8 targets | target stride | stride mod 512 B |
+|------:|----------:|--------------:|-----------------:|
+|  96 | 81% | 384 B | 384 |
+| 112 | 74% | 448 B | 448 |
+| **128** | **60%** | **512 B** | **0** |
+| 144 | 79% | 576 B | 64 |
+| 160 | 69% | 640 B | 128 |
+| **256** | **68%** | **1024 B** | **0** |
+| 288 | 77% | 1152 B | 128 |
+| 320 | 73% | 1280 B | 256 |
+| **384** | **65%** | **1536 B** | **0** |
+
+The per-target stride in constant memory is `bands × 4` bytes. At a multiple of
+128 bands that is a multiple of 512, and the hypothesis is that every target of
+a band step then maps into one constant-cache set, where eight of them thrash a
+four-way set. Four targets fit, and the same geometries show no loss at four
+targets (128 bands, 4 targets: 85%). The prediction that 256 and 384 would dip
+while 288, 320 and 256-at-four-targets would not was made before those five
+were run, and all five held.
+
+**A fix was attempted and reverted.** Padding the constant-memory stride by one
+float bought 2 points at 128 bands and cost 17 at 144 and 16 at 288 — including
+geometries whose constant memory was byte-for-byte unchanged. Passing the
+stride as its own runtime parameter instead of reusing `bands` loses the
+compiler the relationship between the loop bound and the address stride. A
+template parameter carrying the pad would keep the stride expressed as `bands`
+plus a constant; untested.
+
+Real sensor geometries mostly avoid this: HyperBlood is 113 bands, HOT VIS is
+16, AVIRIS is 224. But 128 is exactly the round number someone would configure.
 
 ## Pipeline, end to end
 
@@ -114,128 +197,80 @@ anything.
 
 | variant | fps | p50 ms | p99 ms | upload | sam | detect | download |
 |---------|----:|-------:|-------:|-------:|----:|-------:|---------:|
-| `baseline`  | 79.9 | 37.46 | 38.39 | 36.61 | 0.671 | 0.023 | 0.029 |
-| `optimized` | 79.7 | 37.65 | 39.18 | 37.19 | 0.182 | 0.022 | 0.030 |
-| `half`      | 80.6 | 37.17 | 37.96 | 36.61 | 0.351 | 0.021 | 0.028 |
+| `baseline`  | 83.0 | 35.88 | 40.01 | 35.20 | 0.671 | 0.023 | 0.029 |
+| `optimized` | 83.6 | 35.80 | 36.39 | 35.43 | 0.182 | 0.021 | 0.029 |
+| `half`      | 82.4 | 36.37 | 36.82 | 35.80 | 0.351 | 0.021 | 0.028 |
 
-**The pipeline is PCIe-bound and the kernel is invisible.** Upload is 36.6 ms
-against 0.18 ms of SAM — the kernel is 0.5% of the frame. All three variants
-land within 1% of each other because none of them touches the bottleneck.
-
-Aggregate throughput of 80 fps × 134.2 MB is 10.7 GB/s, and 11.1–11.2 GB/s at
-one stream. That is a PCIe Gen3 ×16 link running flat out; nothing above the
-link can help.
-
-(`nvidia-smi --query-gpu=pcie.link.gen.current` reports Gen1 here, which is a
-red herring — the link power-manages down when idle, and the query was run
-between transfers. The sustained transfer rate is the honest measurement.)
+**The pipeline is PCIe-bound and the kernel is invisible** — 35.4 ms of upload
+against 0.18 ms of SAM, so the kernel is 0.5% of the frame and all three
+variants land within 1.5% of each other. 83 fps × 134.2 MB is 11.2 GB/s, a
+PCIe Gen3 ×16 link running flat out (confirmed by querying the link *under
+load*; the idle query reports Gen1 because the link power-manages down).
 
 ### Streams
 
 | streams | fps | p50 ms |
 |--------:|----:|-------:|
-| 1 | 82.7 | 11.99 |
-| 2 | 84.7 | 23.55 |
-| 3 | 80.8 | 37.09 |
-| 4 | 75.9 | 52.80 |
-| 6 | 77.8 | 51.38 |
+| 1 | 83.8 | 11.89 |
+| 2 | 86.4 | 23.07 |
+| 3 | 81.4 | 36.75 |
+| 4 | 80.2 | 49.90 |
+| 6 | 79.8 | 50.15 |
 
-Throughput is flat and latency grows linearly with stream count — the signature
-of one serialised resource. Extra streams queue behind the same copy engine
-instead of overlapping with anything. **On a discrete GPU `--streams=1` is
-strictly better**: same throughput at a third of the latency. The default of 3
-is wrong for this path and is only likely to pay off on the Orin, where there
-is no copy to serialise on.
+Throughput is flat while latency grows linearly — the signature of one
+serialised resource. Extra streams queue behind the same copy engine instead of
+overlapping with anything. **On a discrete GPU `--streams=1` is strictly
+better**: same throughput at a third of the latency. The default of 3 is wrong
+for this path and should only pay off on the Orin, where there is no copy to
+serialise on.
 
 ## The predictions, scored
 
-Written down in this file before any of them were measured.
+Written into this file before any of them were measured.
 
 | # | prediction | verdict |
 |---|------------|---------|
 | 1 | zero-copy cuts memory traffic ~3× on Orin | **untested** — needs the Orin |
-| 2 | `optimized` approaches 8× over `baseline` at 8 targets | **falsified** — 4.8× |
-| 3 | BIP costs ~8× in load efficiency | **partial** — 31% vs 88% of peak achieved; the sector metric needs `ncu` |
+| 2 | `optimized` approaches 8× over `baseline` at 8 targets | **no** — 5.7×, capped by the constant-cache knee |
+| 3 | BIP costs ~8× in load efficiency | **directionally right** — 32% vs 82% of peak; the sector metric needs `ncu` |
 | 4 | fp16 ≈2× at the kernel, ≈nothing end to end | **confirmed**, both halves |
 
-**Why 2 failed — and why the obvious explanation is wrong.** The speedup tracks
-target count cleanly to 4× and then stops. `optimized` holds 87–91% of peak up
-to four targets and falls to 52% at eight.
+Prediction 2 was closer than 5.7× suggests. Scaling is clean to four targets
+(4.14× at 4), and what stops it at eight is the constant-cache knee rather than
+anything about amortisation. At band counts away from a multiple of 128 the
+same case reaches 7.5–7.7×.
 
-Register pressure was the natural suspect and `cuobjdump -res-usage` rules it
-out:
+### Four explanations that the measurements killed
 
-| instantiation | registers | occupancy on sm_86 |
-|---------------|----------:|-------------------:|
-| `sam_opt_kernel<1>`  | 40 | 100% |
-| `sam_opt_kernel<2>`  | 39 | 100% |
-| `sam_opt_kernel<4>`  | 44 | 87.5% |
-| `sam_opt_kernel<8>`  | 55 | 75% |
-| `sam_half_kernel<4>` | 59 | 75% |
+Recorded because each one cost real GPU time and each is the obvious first
+guess:
 
-75% occupancy does not cost a memory-bound kernel 40% of its bandwidth — such
-kernels usually saturate well below that. And `sam_half_kernel<4>` sits at the
-same 75% while holding 73–75% of peak at every target count, including the ones
-where `optimized` collapses.
+| explanation | how it died |
+|-------------|-------------|
+| register pressure / occupancy | `sam_opt_kernel<8>` is 55 registers, 75% occupancy — and `sam_half_kernel<4>` sits at the same 75% without the cliff. The `<8,8>` variant uses 104 registers and is *faster*. Two pixels per thread, with the fewest registers, is 3× the slowest. |
+| power throttling as the cause | cold vs hot costs `optimized` 13% and `baseline` 6% — real, but not the 40% being explained. |
+| plane-stride aliasing | widths 512, 520, 544 and 576 all give 61–63% at the affected geometry. |
+| padding the constant stride (the fix) | cost 17 points on geometries whose data layout did not change. Reverted. |
 
-What separates them is the ratio of constant-memory reads to global loads in
-the inner loop. Each band step issues one 16-byte load and `TT` reads of
-`c_targets`:
+### One that was an instrumentation bug
 
-| kernel | LDC : 16-byte load | % of peak |
-|--------|-------------------:|----------:|
-| `opt<4>`, 4 px/thread  | 4:1 | 87% |
-| `half<4>`, 8 px/thread | 4:1 | 73–75% |
-| `opt<8>`, 4 px/thread  | **8:1** | **52%** |
-
-Every 4:1 configuration works and the single 8:1 configuration does not. That
-points at constant-cache request rate rather than occupancy, though confirming
-it needs `ncu`, which this host blocked.
-
-If that is right, the fix is the opposite of the obvious one: **more** pixels
-per thread at TT=8, not fewer. Eight pixels per thread would issue two loads
-per band step against the same eight constant reads, restoring 4:1. Halving the
-pixels — the first thing register pressure would suggest — would make it 8:1
-against an 8-byte load and should be worse still. Untested either way.
-
-The dispatch choice is unaffected: at 8 targets one TT=8 pass at 0.277 ms still
-beats two TT=4 passes at 2 × 0.164 = 0.328 ms.
-
-**Why 3 is only partial.** `ncu` returned `ERR_NVGPUCTRPERM` — the rented
-container blocks performance counters, so the per-sector load-efficiency metric
-was never collected. What the wall clock does say is that `bip` achieves 31% of
-peak against `optimized`'s 88%, about 2.8× worse, and that it degrades with
-band count (32% at 128 bands, 14% at 224) as the stride grows. That is
-consistent with the predicted cause without confirming the mechanism.
-
-**Why 4 confirmed.** 1.66× at the kernel rather than a clean 2×, because `half`
-only reaches 73–79% of peak against `optimized`'s 87–91% — half the bytes, but
-less work in flight per thread to hide latency with. End to end it is 80.6 fps
-against 79.7, which is noise, exactly as predicted for an fp32 source.
-
-### Two things nobody predicted
-
-**The baseline was already at the roofline.** It runs at 87–90% of peak at
-every band count. At one target `optimized` beats it by 1.02× — float4 loads
-and constant-memory broadcast together buy **2%**. The entire 4–5× win is
-amortising the cube read across targets, and nothing else. Coalescing is what
-matters; vectorising on top of already-coalesced access does almost nothing.
-
-**Small frames cannot be measured this way.** The 193%-of-peak row is a warning
-about the harness, not a result about the kernel.
+The SM clock was first sampled *after* `cudaEventSynchronize`, by which point
+the GPU is idle and ramping back to boost. It reported 1425 MHz for the slowest
+configuration and 480 MHz for the fastest — exactly backwards. Sampling it
+while the launches are still queued inverted the reading and turned the column
+into the most useful diagnostic here.
 
 ## What the Orin still has to answer
 
-Everything above is a discrete GPU behind a PCIe link, which is the
-configuration this project was *not* built for. The measurements that only
-exist on the Orin:
+Everything above is a discrete GPU behind a PCIe link — the configuration this
+project was *not* built for.
 
 * whether zero-copy removes the upload stage entirely, as designed
-* whether, with the copy gone, the variant choice becomes visible end to end —
-  on this box it was buried under a 36 ms transfer
+* whether, with the copy gone, the variant choice becomes visible end to end;
+  here it was buried under a 35 ms transfer
 * whether more than one stream helps once there is no copy engine to serialise
-  on
-* what fraction of a 40 ms frame budget is left after detection
+* what fraction of a 40 ms frame budget survives detection
+* whether the constant-cache knee bites harder at 15–60 W than it does at 220 W
 
 ## Detection quality on HyperBlood
 

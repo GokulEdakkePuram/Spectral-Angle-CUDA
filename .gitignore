@@ -9,6 +9,8 @@ data/
 
 # Profiling output
 profiles/
+profiles*.tgz
+profiles*.tar.gz
 *.nsys-rep
 *.sqlite
 *.ncu-rep

@@ -153,26 +153,35 @@ mask it stamped, which makes it self-validating.
 
 ### Speed — RTX 3090, 512×512×128, 4 targets
 
+Median of five passes after the clock settles; spread under 3%.
+
 | variant | ms | % of peak bandwidth | vs baseline |
 |---------|---:|--------------------:|------------:|
-| `baseline`  | 0.650 | 88% | 1.00× |
-| `optimized` | 0.164 | 88% | 3.97× |
-| `half`      | 0.098 | 73% | 6.63× |
-| `bip`       | 1.836 | 31% | 0.35× |
+| `baseline`  | 0.665 | 86% | 1.00× |
+| `optimized` | 0.174 | 82% | 3.82× |
+| `half`      | 0.098 | 73% | 6.77× |
+| `bip`       | 1.820 | 32% | 0.37× |
 
-Two findings worth knowing before reading the code.
+Three findings worth knowing before reading the code.
 
-**The baseline was already at the roofline** — 88% of peak. At *one* target the
-optimized kernel beats it by 1.02×, so float4 loads and constant-memory
-broadcast together buy 2%. The entire 4× win is amortising the cube read across
-targets. Coalescing is what matters; vectorising already-coalesced access does
-almost nothing.
+**The baseline was already at the roofline** — 86% of peak. At *one* target the
+optimized kernel beats it by 1.04×, so `float4` loads and constant-memory
+broadcast together buy 4%. The entire ~4× win is amortising the cube read
+across targets. Coalescing is what matters; vectorising already-coalesced
+access does almost nothing.
 
-**Getting the layout wrong costs 2.8×** — `bip` runs at 31% of peak, and worse
-as bands grow. That is the one mistake that is expensive.
+**Getting the layout wrong costs 2.7×** — `bip` runs at 32% of peak and worse
+as the spectrum spans more cache lines (14% at 224 bands). That is the one
+mistake that is expensive.
+
+**Constant-memory reads are the second wall.** Scoring stays memory-bound at
+84–85% of peak up to four targets, then drops to ~60% at eight, because the
+inner loop issues one constant read per target per vector load. The GPU says so
+itself: the SM clock *rises* from 765 MHz to 1440 MHz as bandwidth falls, which
+is what a kernel that has stopped waiting on DRAM looks like.
 
 End to end on a discrete GPU the pipeline is PCIe-bound and the kernel is
-invisible: 36.6 ms of upload against 0.18 ms of SAM, ~80 fps regardless of
+invisible: 35 ms of upload against 0.18 ms of SAM, ~83 fps regardless of
 variant. That is the configuration this was *not* built for — the Orin's
 unified memory is the point, and is still unmeasured.
 
