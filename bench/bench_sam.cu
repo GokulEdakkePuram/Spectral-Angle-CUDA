@@ -10,8 +10,12 @@
 //      that says how close to the hardware's ceiling the kernel actually is.
 
 #include <cuda_runtime.h>
+#if HSI_HAVE_NVML
+#include <nvml.h>
+#endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +45,13 @@ struct Options {
   int bands = 128;
   int targets = 4;
   int iterations = 200;
-  int warmup = 20;
+  /// Warm-up is wall-clock, not iteration count. A power-capped card takes
+  /// seconds to settle from its boost clock onto a sustainable one, and how
+  /// many iterations that takes depends on the kernel — so a fixed count
+  /// measures whatever thermal state it happened to land in.
+  double warmup_ms = 2000.0;
+  /// Timed passes; the reported figure is the median of these.
+  int repeats = 5;
   bool check_only = false;
   double tolerance = 2e-3;  ///< radians
   /// Pixels per thread for the Optimized kernel: 2, 4 or 8. 0 sweeps all three.
@@ -60,20 +70,50 @@ Options parse(int argc, char** argv) {
     else if (key == "--bands") options.bands = std::stoi(value);
     else if (key == "--targets") options.targets = std::stoi(value);
     else if (key == "--iterations") options.iterations = std::stoi(value);
-    else if (key == "--warmup") options.warmup = std::stoi(value);
+    else if (key == "--warmup-ms") options.warmup_ms = std::stod(value);
+    else if (key == "--repeats") options.repeats = std::stoi(value);
     else if (key == "--tolerance") options.tolerance = std::stod(value);
     else if (key == "--opt-pixels") options.opt_pixels = std::stoi(value);
     else if (key == "--check-only") options.check_only = true;
     else if (key == "--help") {
       std::puts(
           "bench_sam [--height=N --width=N --bands=N --targets=N]\n"
-          "          [--iterations=N --warmup=N --tolerance=RAD --check-only]\n"
+          "          [--iterations=N --tolerance=RAD --check-only]\n"
+          "          [--warmup-ms=MS]       warm to a steady clock first [2000]\n"
+          "          [--repeats=N]          timed passes; median reported [5]\n"
           "          [--opt-pixels=2|4|8]   pixels per thread for `optimized`;\n"
           "                                 omit to time all three");
       std::exit(0);
     }
   }
   return options;
+}
+
+/// Current SM clock in MHz, or 0 if NVML is unavailable.
+///
+/// Printed beside every timing because a throttled result is otherwise
+/// indistinguishable from a slow kernel. On a card whose power limit is well
+/// under its board maximum the SM clock can fall by more than 2x under
+/// sustained load while the memory clock does not move at all — which changes
+/// memory-bound and SM-bound kernels by very different amounts.
+unsigned current_sm_clock_mhz() {
+#if HSI_HAVE_NVML
+  static const bool ready = (nvmlInit_v2() == NVML_SUCCESS);
+  if (!ready) return 0;
+  int ordinal = 0;
+  if (cudaGetDevice(&ordinal) != cudaSuccess) return 0;
+  nvmlDevice_t device;
+  // NVML indices track CUDA ordinals only when CUDA_VISIBLE_DEVICES is unset;
+  // good enough for a single-GPU benchmark, and 0 on any mismatch.
+  if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(ordinal), &device) != NVML_SUCCESS) {
+    return 0;
+  }
+  unsigned mhz = 0;
+  if (nvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &mhz) != NVML_SUCCESS) return 0;
+  return mhz;
+#else
+  return 0;
+#endif
 }
 
 struct Buffers {
@@ -122,37 +162,71 @@ Agreement compare(const std::vector<float>& gpu_angle,
   return result;
 }
 
-float time_variant(hsi::SamVariant variant, const Buffers& buffers,
-                   hsi::CubeShape shape, int targets, int iterations, int warmup,
-                   int opt_pixels = 0) {
+/// One variant's timing: the median of several passes, plus the spread and the
+/// SM clock at the end, so a throttled measurement announces itself.
+struct Timing {
+  float median_ms = 0;
+  float min_ms = 0;
+  float max_ms = 0;
+  unsigned sm_mhz = 0;
+
+  /// Peak-to-peak spread as a percentage of the median.
+  double spread_pct() const {
+    return median_ms > 0 ? 100.0 * (max_ms - min_ms) / median_ms : 0.0;
+  }
+};
+
+Timing time_variant(hsi::SamVariant variant, const Buffers& buffers,
+                    hsi::CubeShape shape, int targets, int iterations,
+                    double warmup_ms, int repeats, int opt_pixels = 0) {
   const void* cube = (variant == hsi::SamVariant::BipDirect) ? static_cast<const void*>(buffers.d_bip)
                      : (variant == hsi::SamVariant::Half)    ? buffers.d_half
                                                              : static_cast<const void*>(buffers.d_bsq);
 
-  for (int i = 0; i < warmup; ++i) {
+  const auto launch = [&] {
     CUDA_OK(hsi::launch_sam_best(variant, cube, shape, buffers.d_targets,
                                  buffers.d_norms, targets, buffers.d_angle,
                                  buffers.d_target_id, nullptr, opt_pixels));
+  };
+
+  // Warm until the clock has settled, measured in wall time rather than
+  // launches. Batched so the queue cannot run away between checks.
+  const auto warm_begin = std::chrono::steady_clock::now();
+  while (std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - warm_begin).count() < warmup_ms) {
+    for (int i = 0; i < 16; ++i) launch();
+    CUDA_OK(cudaDeviceSynchronize());
   }
   CUDA_OK(cudaDeviceSynchronize());
 
   cudaEvent_t begin, end;
   CUDA_OK(cudaEventCreate(&begin));
   CUDA_OK(cudaEventCreate(&end));
-  CUDA_OK(cudaEventRecord(begin));
-  for (int i = 0; i < iterations; ++i) {
-    CUDA_OK(hsi::launch_sam_best(variant, cube, shape, buffers.d_targets,
-                                 buffers.d_norms, targets, buffers.d_angle,
-                                 buffers.d_target_id, nullptr, opt_pixels));
-  }
-  CUDA_OK(cudaEventRecord(end));
-  CUDA_OK(cudaEventSynchronize(end));
 
-  float ms = 0;
-  CUDA_OK(cudaEventElapsedTime(&ms, begin, end));
+  std::vector<float> samples;
+  const int passes = std::max(1, repeats);
+  samples.reserve(static_cast<std::size_t>(passes));
+  for (int r = 0; r < passes; ++r) {
+    CUDA_OK(cudaEventRecord(begin));
+    for (int i = 0; i < iterations; ++i) launch();
+    CUDA_OK(cudaEventRecord(end));
+    CUDA_OK(cudaEventSynchronize(end));
+    float ms = 0;
+    CUDA_OK(cudaEventElapsedTime(&ms, begin, end));
+    samples.push_back(ms / static_cast<float>(iterations));
+  }
   CUDA_OK(cudaEventDestroy(begin));
   CUDA_OK(cudaEventDestroy(end));
-  return ms / static_cast<float>(iterations);
+
+  // Median, not mean: one pass that happened to catch a clock transition
+  // should not drag the reported figure.
+  std::sort(samples.begin(), samples.end());
+  Timing timing;
+  timing.median_ms = samples[samples.size() / 2];
+  timing.min_ms = samples.front();
+  timing.max_ms = samples.back();
+  timing.sm_mhz = current_sm_clock_mhz();
+  return timing;
 }
 
 }  // namespace
@@ -296,16 +370,19 @@ int main(int argc, char** argv) {
   }
 
   // ---- throughput -------------------------------------------------------
-  std::printf("\n%-11s %10s %10s %10s %9s %s\n", "variant", "ms", "GB/s",
-              "% of peak", "Gpix/s", "vs baseline");
-  std::printf("%s\n", std::string(72, '-').c_str());
+  std::printf("\n%-11s %9s %9s %9s %8s %9s %8s %8s\n", "variant", "ms", "GB/s",
+              "% of peak", "Gpix/s", "vs base", "spread", "SM MHz");
+  std::printf("%s\n", std::string(80, '-').c_str());
 
   float baseline_ms = 0;
+  unsigned first_clock = 0;
   for (hsi::SamVariant variant : variants) {
-    const float ms = time_variant(variant, buffers, shape, library.size(),
-                                  options.iterations, options.warmup,
-                                  options.opt_pixels);
+    const Timing timing =
+        time_variant(variant, buffers, shape, library.size(), options.iterations,
+                     options.warmup_ms, options.repeats, options.opt_pixels);
+    const float ms = timing.median_ms;
     if (variant == hsi::SamVariant::Baseline) baseline_ms = ms;
+    if (first_clock == 0) first_clock = timing.sm_mhz;
 
     // Bytes the kernel must read from DRAM. The baseline re-reads the cube
     // once per target because its target loop is outermost; the vectorised
@@ -322,11 +399,23 @@ int main(int argc, char** argv) {
     const double bytes = static_cast<double>(shape.elements()) * element_bytes * passes;
     const double gbs = bytes / (ms * 1.0e-3) / 1.0e9;
 
-    std::printf("%-11s %10.3f %10.1f %9.0f%% %9.2f %10.2fx\n",
+    std::printf("%-11s %9.3f %9.1f %8.0f%% %8.2f %8.2fx %7.1f%% %8u\n",
                 hsi::to_string(variant), ms, gbs,
                 peak_gbs > 0 ? 100.0 * gbs / peak_gbs : 0.0,
                 static_cast<double>(pixels) / (ms * 1.0e-3) / 1.0e9,
-                baseline_ms > 0 ? baseline_ms / ms : 1.0);
+                baseline_ms > 0 ? baseline_ms / ms : 1.0, timing.spread_pct(),
+                timing.sm_mhz);
+  }
+
+  if (first_clock == 0) {
+    std::printf("\nSM MHz reads 0: NVML unavailable, so throttling is invisible here.\n");
+  } else if (props.clockRate > 0 &&
+             first_clock < static_cast<unsigned>(props.clockRate / 1000) * 3 / 4) {
+    std::printf(
+        "\nNOTE: SM clock is %u MHz against a %d MHz boost - this card is\n"
+        "      throttling, and SM-bound kernels lose far more to that than\n"
+        "      memory-bound ones. Compare variants only within this table.\n",
+        first_clock, props.clockRate / 1000);
   }
 
   // Pixels per thread for `optimized`, which changes how many constant-memory
@@ -334,24 +423,26 @@ int main(int argc, char** argv) {
   // and 4:1 at eight, and the sm_86 measurements say the ratio is what costs
   // the bandwidth - so this sweep is the experiment, not a tuning knob.
   if (options.opt_pixels == 0) {
-    std::printf("\noptimized, pixels per thread (constant reads per vector load)\n");
-    std::printf("%10s %10s %10s %10s %14s\n", "px/thread", "ms", "GB/s",
-                "% of peak", "const/16B ld");
-    std::printf("%s\n", std::string(60, '-').c_str());
+    std::printf("\noptimized, pixels per thread\n");
+    std::printf("%10s %9s %9s %9s %14s %8s %8s\n", "px/thread", "ms", "GB/s",
+                "% of peak", "const/16B ld", "spread", "SM MHz");
+    std::printf("%s\n", std::string(74, '-').c_str());
     const int per_pass = std::min(library.size(), 8);
     for (int ppt : {2, 4, 8}) {
-      const float ms = time_variant(hsi::SamVariant::Optimized, buffers, shape,
-                                    library.size(), options.iterations,
-                                    options.warmup, ppt);
+      const Timing timing = time_variant(hsi::SamVariant::Optimized, buffers,
+                                         shape, library.size(), options.iterations,
+                                         options.warmup_ms, options.repeats, ppt);
       const int passes = (library.size() + 7) / 8;
       const double bytes = static_cast<double>(shape.elements()) * 4.0 * passes;
-      const double gbs = bytes / (ms * 1.0e-3) / 1.0e9;
+      const double gbs = bytes / (timing.median_ms * 1.0e-3) / 1.0e9;
       // Constant-memory reads per 16 bytes loaded: TT reads ride on PPT/4 of
       // a float4, so two pixels per thread doubles the ratio and eight halves
-      // it. This is the quantity the cliff tracks.
-      std::printf("%10d %10.3f %10.1f %9.0f%% %14.1f\n", ppt, ms, gbs,
+      // it. Note this also changes the load width, so the two effects are not
+      // separable from this sweep alone.
+      std::printf("%10d %9.3f %9.1f %8.0f%% %14.1f %7.1f%% %8u\n", ppt,
+                  timing.median_ms, gbs,
                   peak_gbs > 0 ? 100.0 * gbs / peak_gbs : 0.0,
-                  per_pass / (ppt / 4.0));
+                  per_pass / (ppt / 4.0), timing.spread_pct(), timing.sm_mhz);
     }
   }
 
@@ -360,8 +451,14 @@ int main(int argc, char** argv) {
     cudaEvent_t begin, end;
     CUDA_OK(cudaEventCreate(&begin));
     CUDA_OK(cudaEventCreate(&end));
-    for (int i = 0; i < options.warmup; ++i) {
-      CUDA_OK(hsi::launch_transpose_bip_to_bsq(buffers.d_bip, buffers.d_bsq, shape, nullptr));
+    const auto warm_begin = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - warm_begin).count() <
+           options.warmup_ms) {
+      for (int i = 0; i < 16; ++i) {
+        CUDA_OK(hsi::launch_transpose_bip_to_bsq(buffers.d_bip, buffers.d_bsq, shape, nullptr));
+      }
+      CUDA_OK(cudaDeviceSynchronize());
     }
     CUDA_OK(cudaDeviceSynchronize());
     CUDA_OK(cudaEventRecord(begin));

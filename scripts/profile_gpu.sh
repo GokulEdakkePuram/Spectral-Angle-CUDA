@@ -24,18 +24,25 @@ echo "writing to $OUT"
   echo; echo "=== nvcc ==="; nvcc --version || true
 } > "$OUT/environment.txt" 2>&1
 
-# Persistence and locked clocks remove the biggest source of run-to-run noise.
-# Both need root and neither is available on every rental host, so failure to
-# apply them is a warning rather than an error - it just means wider variance.
-if nvidia-smi -pm 1 >/dev/null 2>&1; then
-  MAX_SM=$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits | head -1)
-  MAX_MEM=$(nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits | head -1)
-  if nvidia-smi -lgc "$MAX_SM" >/dev/null 2>&1; then
-    echo "locked SM clock to ${MAX_SM} MHz, memory ${MAX_MEM} MHz"
-  fi
-else
-  echo "WARNING: could not lock clocks (needs root); expect wider variance"
-fi
+# Deliberately NOT locking the SM clock to its maximum.
+#
+# On a card whose power limit sits below its board maximum - most rental
+# hardware, and every Jetson - the maximum SM clock is not sustainable. Pinning
+# it just means every measurement drifts downwards as the card throttles into
+# its real operating point, and the first variant timed looks faster than the
+# last for no reason to do with the code.
+#
+# Instead bench_sam warms up by wall-clock time until the clock has settled,
+# reports the median of several passes with the spread, and prints the SM clock
+# beside each result so a throttled number says so.
+nvidia-smi -pm 1 >/dev/null 2>&1 && echo "persistence mode on" \
+  || echo "note: could not enable persistence mode (needs root)"
+
+POWER=$(nvidia-smi --query-gpu=power.limit,power.max_limit --format=csv,noheader 2>/dev/null)
+echo "power limit: $POWER"
+echo "$POWER" | awk -F'[ ,]+' '$1 < $3 * 0.9 {
+  print "  this card is capped below its board maximum, so expect the SM clock"
+  print "  to fall under sustained load - watch the SM MHz column" }' 
 
 # ---- 1. correctness, before anything is timed ------------------------------
 echo
@@ -111,7 +118,7 @@ smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct,\
 l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum \
       -o "$OUT/kernels" \
       "$BENCH" --width=512 --height=512 --bands=128 --targets=4 \
-               --iterations=3 --warmup=0 \
+               --iterations=3 --warmup-ms=0 --repeats=1 \
       > "$OUT/ncu.log" 2>&1 || echo "ncu failed (often needs --privileged or CAP_SYS_ADMIN); see $OUT/ncu.log"
 fi
 

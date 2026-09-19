@@ -132,7 +132,7 @@ sm__warps_active.avg.pct_of_peak_sustained_active,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct \
       -o "$OUT/kernels" \
       "$BENCH" --width=512 --height=512 --bands=128 --targets=4 \
-               --iterations=3 --warmup=0 \
+               --iterations=3 --warmup-ms=0 --repeats=1 \
       > "$OUT/ncu.log" 2>&1 || echo "ncu needs root on Jetson; see $OUT/ncu.log"
 fi
 
