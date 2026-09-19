@@ -88,12 +88,25 @@ because its target loop is outermost and re-reads the cube every time.
 | 128 | 134.2 | 0.653 | 0.164 | 0.099 | 1.813 | 87% |
 | 224 | 234.9 | 1.166 | 0.278 | 0.158 | 7.133 | 90% |
 
-At 16 bands the harness reports `baseline` at **193% of peak**, which is
-impossible and marks the whole row as invalid: at 0.037 ms the kernel is short
-enough that launch overhead and L2 residency dominate the measurement. Treat
-anything under about 30 MB per frame as unmeasured rather than fast. That
-includes the HOT VIS geometry (256×512×16 = 8.4 MB), so the per-frame figures
-predicted for it earlier in this project mean nothing.
+At 16 bands `baseline` reports **193% of peak**, which looks like a broken
+measurement and is not one. Holding iterations at 100, 1000 and 5000 gives
+183%, 179% and 172% — it does not amortise away, so it is not launch overhead.
+
+It is L2 reuse, and it is real. `baseline`'s target loop is outermost *per
+thread*, so each thread re-reads its own spectrum `num_targets` times back to
+back. The working set of one resident wave is roughly
+`126k threads × bands × 4 B`, which at 16 bands is ~8 MB against the 3090's
+6 MB L2 — so three of the four passes largely hit cache. At 128 bands the same
+figure is 64 MB, nothing is retained, and the number falls back to true DRAM
+bandwidth.
+
+So the *time* is trustworthy; it is the `% of peak` column that misleads,
+because it divides useful bytes by DRAM peak while some of those bytes never
+came from DRAM. Read that column as meaningless wherever
+`resident_threads × bands × 4 B` approaches L2 size, and note this is also why
+`optimized` looks poor at 16 bands (62%): it reads the cube once, so there is
+no redundancy for L2 to absorb, and 0.029 ms is too little work to saturate
+anything.
 
 ## Pipeline, end to end
 
@@ -109,8 +122,13 @@ predicted for it earlier in this project mean nothing.
 against 0.18 ms of SAM — the kernel is 0.5% of the frame. All three variants
 land within 1% of each other because none of them touches the bottleneck.
 
-Aggregate throughput of 80 fps × 134.2 MB is 10.7 GB/s, which is a PCIe Gen3
-×16 link running flat out. Nothing above the link can help.
+Aggregate throughput of 80 fps × 134.2 MB is 10.7 GB/s, and 11.1–11.2 GB/s at
+one stream. That is a PCIe Gen3 ×16 link running flat out; nothing above the
+link can help.
+
+(`nvidia-smi --query-gpu=pcie.link.gen.current` reports Gen1 here, which is a
+red herring — the link power-manages down when idle, and the query was run
+between transfers. The sustained transfer rate is the honest measurement.)
 
 ### Streams
 
@@ -140,17 +158,48 @@ Written down in this file before any of them were measured.
 | 3 | BIP costs ~8× in load efficiency | **partial** — 31% vs 88% of peak achieved; the sector metric needs `ncu` |
 | 4 | fp16 ≈2× at the kernel, ≈nothing end to end | **confirmed**, both halves |
 
-**Why 2 failed.** The speedup tracks target count cleanly to 4× and then stops.
-The cause is in the `% of peak` column: `optimized` holds 87–91% up to four
-targets and falls to 52% at eight. Eight targets × four pixels is 32 live
-accumulator registers, and that is past the occupancy knee on sm_86 — the
-kernel stops having enough warps resident to keep the memory pipe full. The
-design notes flagged 32 registers as "about where occupancy starts to pay for
-further widening"; it turns out to be slightly past that, not at it.
+**Why 2 failed — and why the obvious explanation is wrong.** The speedup tracks
+target count cleanly to 4× and then stops. `optimized` holds 87–91% of peak up
+to four targets and falls to 52% at eight.
 
-The dispatch choice is still right. At 8 targets, one TT=8 pass at 0.277 ms
-beats two TT=4 passes at 2 × 0.164 = 0.328 ms. The obvious experiment is TT=8
-with two pixels per thread instead of four, which halves the accumulators.
+Register pressure was the natural suspect and `cuobjdump -res-usage` rules it
+out:
+
+| instantiation | registers | occupancy on sm_86 |
+|---------------|----------:|-------------------:|
+| `sam_opt_kernel<1>`  | 40 | 100% |
+| `sam_opt_kernel<2>`  | 39 | 100% |
+| `sam_opt_kernel<4>`  | 44 | 87.5% |
+| `sam_opt_kernel<8>`  | 55 | 75% |
+| `sam_half_kernel<4>` | 59 | 75% |
+
+75% occupancy does not cost a memory-bound kernel 40% of its bandwidth — such
+kernels usually saturate well below that. And `sam_half_kernel<4>` sits at the
+same 75% while holding 73–75% of peak at every target count, including the ones
+where `optimized` collapses.
+
+What separates them is the ratio of constant-memory reads to global loads in
+the inner loop. Each band step issues one 16-byte load and `TT` reads of
+`c_targets`:
+
+| kernel | LDC : 16-byte load | % of peak |
+|--------|-------------------:|----------:|
+| `opt<4>`, 4 px/thread  | 4:1 | 87% |
+| `half<4>`, 8 px/thread | 4:1 | 73–75% |
+| `opt<8>`, 4 px/thread  | **8:1** | **52%** |
+
+Every 4:1 configuration works and the single 8:1 configuration does not. That
+points at constant-cache request rate rather than occupancy, though confirming
+it needs `ncu`, which this host blocked.
+
+If that is right, the fix is the opposite of the obvious one: **more** pixels
+per thread at TT=8, not fewer. Eight pixels per thread would issue two loads
+per band step against the same eight constant reads, restoring 4:1. Halving the
+pixels — the first thing register pressure would suggest — would make it 8:1
+against an 8-byte load and should be worse still. Untested either way.
+
+The dispatch choice is unaffected: at 8 targets one TT=8 pass at 0.277 ms still
+beats two TT=4 passes at 2 × 0.164 = 0.328 ms.
 
 **Why 3 is only partial.** `ncu` returned `ERR_NVGPUCTRPERM` — the rented
 container blocks performance counters, so the per-sector load-efficiency metric
