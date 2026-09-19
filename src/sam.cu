@@ -1,7 +1,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <vector>
 
 #include "hsi/sam_cuda.hpp"
 
@@ -126,7 +128,7 @@ __global__ void sam_bip_kernel(const float* __restrict__ cube, int bands,
 template <int TT, int PPT>
 __global__ void sam_opt_kernel(const float* __restrict__ cube, int bands,
                                std::size_t pixels, std::size_t stride,
-                               int t_base, bool first, bool last,
+                               int t_base, int target_stride, bool first, bool last,
                                float* __restrict__ out_angle,
                                int* __restrict__ out_target) {
   static_assert(PPT == 2 || PPT == 4 || PPT == 8, "PPT must be 2, 4 or 8");
@@ -172,7 +174,8 @@ __global__ void sam_opt_kernel(const float* __restrict__ cube, int bands,
     // exists to vary.
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
-      const float r = c_targets[static_cast<std::size_t>(t_base + t) * bands + b];
+      const float r =
+          c_targets[static_cast<std::size_t>(t_base + t) * target_stride + b];
 #pragma unroll
       for (int k = 0; k < PPT; ++k) dot[t][k] = fmaf(v[k], r, dot[t][k]);
     }
@@ -210,7 +213,7 @@ __global__ void sam_opt_kernel(const float* __restrict__ cube, int bands,
 template <int TT>
 __global__ void sam_half_kernel(const __half* __restrict__ cube, int bands,
                                 std::size_t pixels, std::size_t stride,
-                                int t_base, bool first, bool last,
+                                int t_base, int target_stride, bool first, bool last,
                                 float* __restrict__ out_angle,
                                 int* __restrict__ out_target) {
   const std::size_t oct = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -244,7 +247,8 @@ __global__ void sam_half_kernel(const __half* __restrict__ cube, int bands,
 
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
-      const float r = c_targets[static_cast<std::size_t>(t_base + t) * bands + b];
+      const float r =
+          c_targets[static_cast<std::size_t>(t_base + t) * target_stride + b];
 #pragma unroll
       for (int k = 0; k < kOct; ++k) dot[t][k] = fmaf(v[k], r, dot[t][k]);
     }
@@ -348,14 +352,25 @@ cudaError_t upload_targets(const float* values, const float* norms,
                            int num_targets, int bands) {
   if (num_targets <= 0 || bands <= 0) return cudaErrorInvalidValue;
   if (num_targets > kMaxConstTargets) return cudaErrorInvalidValue;
-  const std::size_t elems = static_cast<std::size_t>(num_targets) * bands;
+  const int target_stride = constant_target_stride(bands);
+  const std::size_t elems = static_cast<std::size_t>(num_targets) * target_stride;
   if (elems > kMaxConstTargetElems) return cudaErrorInvalidValue;
+
+  // Re-lay the library at the padded stride. The gap is never read; it exists
+  // only to keep consecutive targets off a 512-byte boundary.
+  std::vector<float> padded(elems, 0.0f);
+  for (int t = 0; t < num_targets; ++t) {
+    const float* src = values + static_cast<std::size_t>(t) * bands;
+    std::copy(src, src + bands,
+              padded.begin() + static_cast<std::size_t>(t) * target_stride);
+  }
 
   // Synchronous on purpose. Both source buffers belong to the caller and may
   // be gone by the time an async copy drained, and this runs once at setup -
   // never in the per-frame path - so there is nothing to gain by deferring it.
-  cudaError_t err = cudaMemcpyToSymbol(c_targets, values, elems * sizeof(float),
-                                       0, cudaMemcpyHostToDevice);
+  cudaError_t err = cudaMemcpyToSymbol(c_targets, padded.data(),
+                                       elems * sizeof(float), 0,
+                                       cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return err;
 
   // Store reciprocals so the kernel multiplies instead of dividing.
@@ -377,6 +392,7 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
 
   const std::size_t pixels = shape.pixels();
   const std::size_t stride = bsq_plane_stride(shape);
+  const int target_stride = constant_target_stride(shape.bands);
   int* out_target = reinterpret_cast<int*>(d_target_id);
 
   switch (variant) {
@@ -412,7 +428,7 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
 #define HSI_LAUNCH_OPT(N, P)                                                   \
   sam_opt_kernel<N, P><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(   \
       static_cast<const float*>(d_cube), shape.bands, pixels, stride, done,     \
-      first, last, d_angle_rad, out_target)
+      target_stride, first, last, d_angle_rad, out_target)
 #define HSI_LAUNCH_OPT_TT(P)                                                   \
   do {                                                                         \
     if (tt == 8) HSI_LAUNCH_OPT(8, P);                                          \
@@ -445,7 +461,7 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
 #define HSI_LAUNCH_HALF(N)                                                    \
   sam_half_kernel<N><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(    \
       static_cast<const __half*>(d_cube), shape.bands, pixels, stride, done,   \
-      first, last, d_angle_rad, out_target)
+      target_stride, first, last, d_angle_rad, out_target)
         if (tt == 4) HSI_LAUNCH_HALF(4);
         else if (tt == 2) HSI_LAUNCH_HALF(2);
         else HSI_LAUNCH_HALF(1);

@@ -51,6 +51,21 @@ inline std::size_t bsq_device_elements(CubeShape shape) {
   return bsq_plane_stride(shape) * static_cast<std::size_t>(shape.bands);
 }
 
+/// Per-target stride, in floats, of the target library in constant memory.
+///
+/// Padded away from multiples of 128 floats, because at exactly 512 bytes the
+/// constant cache maps every target of a band step into one set and an
+/// eight-target library thrashes a four-way set. Measured on sm_86: at 8
+/// targets the optimized kernel reaches 73-81% of peak at 96, 112, 144, 288 and
+/// 320 bands, and 60-68% at 128, 256 and 384 - the three that are multiples of
+/// 128. The same geometries at 4 targets show no loss, which is what fixes the
+/// cause to set associativity rather than anything about the band count itself.
+///
+/// One float of padding is enough to break it and costs nothing.
+inline int constant_target_stride(int bands) {
+  return (bands > 0 && bands % 128 == 0) ? bands + 1 : bands;
+}
+
 /// Largest target library that fits the constant-memory staging buffer.
 /// Libraries beyond this are scored in several passes over the cube, which
 /// costs a re-read and so is worth avoiding.
