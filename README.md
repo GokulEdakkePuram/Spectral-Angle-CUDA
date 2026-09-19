@@ -151,6 +151,33 @@ mask it stamped, which makes it self-validating.
 
 ## Does it work
 
+### Speed — RTX 3090, 512×512×128, 4 targets
+
+| variant | ms | % of peak bandwidth | vs baseline |
+|---------|---:|--------------------:|------------:|
+| `baseline`  | 0.650 | 88% | 1.00× |
+| `optimized` | 0.164 | 88% | 3.97× |
+| `half`      | 0.098 | 73% | 6.63× |
+| `bip`       | 1.836 | 31% | 0.35× |
+
+Two findings worth knowing before reading the code.
+
+**The baseline was already at the roofline** — 88% of peak. At *one* target the
+optimized kernel beats it by 1.02×, so float4 loads and constant-memory
+broadcast together buy 2%. The entire 4× win is amortising the cube read across
+targets. Coalescing is what matters; vectorising already-coalesced access does
+almost nothing.
+
+**Getting the layout wrong costs 2.8×** — `bip` runs at 31% of peak, and worse
+as bands grow. That is the one mistake that is expensive.
+
+End to end on a discrete GPU the pipeline is PCIe-bound and the kernel is
+invisible: 36.6 ms of upload against 0.18 ms of SAM, ~80 fps regardless of
+variant. That is the configuration this was *not* built for — the Orin's
+unified memory is the point, and is still unmeasured.
+
+### Accuracy
+
 On HyperBlood's `F_1` — blood beside ketchup, artificial blood, beetroot juice,
 poster paint, tomato concentrate and acrylic paint, all red — with the target
 signature taken from that scene:

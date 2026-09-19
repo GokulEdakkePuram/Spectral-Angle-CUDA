@@ -1,18 +1,15 @@
 # Results
 
-**Status: no GPU measurements yet.** Nothing here has run on a GPU. The
-performance tables hold the ceiling the model predicts, the commands that
-produce the real numbers, and what each should be checked against.
+Measured on an **RTX 3090** (sm_86, 82 SMs, 936.1 GB/s peak, CUDA 13.0, driver
+580.142) in a rented container, and on the CPU reference for detection quality.
 
-The correctness and detection-quality sections below *are* measured — on the
-CPU reference, against real HyperBlood data. Those results stand on their own,
-and the GPU is expected to reproduce the angle map to within the tolerances in
-the correctness table.
+**Not yet measured on the Orin.** Everything about zero-copy and unified memory
+below is still a prediction.
 
 ## What to run
 
 ```sh
-scripts/build.sh                 # or: scripts/build.sh 87   on the Orin
+scripts/build.sh 86              # one arch; the default builds seven
 scripts/profile_gpu.sh           # discrete GPU
 scripts/profile_jetson.sh        # AGX Orin
 ```
@@ -20,84 +17,29 @@ scripts/profile_jetson.sh        # AGX Orin
 Both write a timestamped directory under `profiles/`. Correctness runs first
 and gates everything after it.
 
-## Predicted ceilings
-
-SAM is bandwidth bound at 0.5 FLOP/byte (see [design.md](design.md)), so the
-kernel cannot beat `cube_bytes / peak_bandwidth`. These are therefore hard
-upper bounds for the SAM kernel alone — not for the pipeline, which also pays
-for detection and readback, and in `--memory=copy` for the upload as well.
-
-| cube                     |     MB |
-|--------------------------|-------:|
-| synthetic 512×512×128     |  134.2 |
-| HyperBlood 520×696×113    |  163.6 |
-| HOT VIS 256×512×16        |    8.4 |
-
-| device                   | peak GB/s | 512×512×128 | 520×696×113 | 256×512×16 |
-|--------------------------|----------:|------------:|------------:|-----------:|
-| AGX Orin (LPDDR5)        |     204.8 |   1526 fps |   1252 fps |  24414 fps |
-| L4                       |     300.0 |   2235 fps |   1834 fps |  35763 fps |
-| A10                      |     600.0 |   4470 fps |   3668 fps |  71526 fps |
-| RTX 4090                 |    1008.0 |   7510 fps |   6162 fps | 120163 fps |
-| A100 80GB                |    1935.0 |  14417 fps |  11829 fps | 230670 fps |
-| H100 SXM                 |    3350.0 |  24959 fps |  20478 fps | 399351 fps |
-
-A well-behaved streaming kernel usually lands at 70–85% of theoretical peak, so
-treat anything above ~85% as a measurement error and anything below ~50% as a
-problem worth finding with `ncu`.
-
-The headline for the Orin: even the heaviest configuration here has roughly
-**1250 fps** of headroom against a 25 fps sensor, so the frame budget is not
-close to tight. The interesting question on that platform is not whether it
-keeps up but how much of the 40 ms budget is left for everything downstream.
-
-## The predictions worth falsifying
-
-These are the specific claims the design rests on. Each one is a number the
-profiling scripts produce directly.
-
-**1. Zero-copy is roughly a 3× reduction in memory traffic on Orin.**
-In `--memory=copy` the H2D reads 134 MB from LPDDR5 and writes 134 MB back to
-the same LPDDR5, then the kernel reads 134 MB again: 402 MB of traffic for a
-134 MB cube. Zero-copy moves 134 MB. So the end-to-end frame time should drop
-substantially, and the `upload` column of the stage breakdown should go to
-zero by construction. Produced by `scripts/profile_jetson.sh`, section
-"copy vs zero-copy".
-
-**2. The optimized kernel pulls away from the baseline as targets increase.**
-At one target both read the cube exactly once, so the gap is only
-vectorisation and constant memory — expect something modest. At eight targets
-the baseline reads the cube eight times and the optimized kernel once, so the
-gap should approach 8×. If it does not, the amortisation is not working.
-Produced by the `sweep: targets` section of either script.
-
-**3. BIP costs about 8× on load efficiency.**
-A warp reading at a stride of `bands` fetches 32 sectors to use 128 bytes of
-them. `smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct` in the
-`ncu` output should be near 100% for `optimized` and near 12.5% for `bip`.
-The wall-clock gap will be smaller than that because the L2 absorbs some of it.
-
-**4. fp16 is close to 2× at the kernel and roughly nothing end to end.**
-`bench_sam` measures kernels in isolation, where halving the bytes should
-nearly halve the time. The pipeline narrows an fp32 cube on the device first,
-so end to end it reads 4 bytes, writes 2 and reads 2 — worse than reading 4.
-If the pipeline shows `half` winning end to end, something is wrong with the
-measurement, not with the world.
-
-## Kernel throughput
-
-_To be filled from `kernels_512x512x128_t4.txt`._
-
-| device | variant | ms | GB/s | % of peak | vs baseline |
-|--------|---------|---:|-----:|----------:|------------:|
-| | `baseline`  | | | | 1.00× |
-| | `optimized` | | | | |
-| | `half`      | | | | |
-| | `bip`       | | | | |
-
 ## Correctness
 
-### Host side, measured
+### GPU vs the CPU reference
+
+All four variants, both shapes, on the RTX 3090. Tolerance is 2e-3 rad for the
+fp32 paths and 5e-3 for fp16.
+
+| variant | 96×128×24, 4 targets | 520×696×113, 8 targets | verdict |
+|---------|---------------------:|-----------------------:|---------|
+| `baseline`  | 1.80e-05 | 5.80e-05 | PASS |
+| `optimized` | 1.80e-05 | 5.80e-05 | PASS |
+| `half`      | 1.72e-04 | 1.27e-04 | PASS |
+| `bip`       | 1.80e-05 | 5.80e-05 | PASS |
+
+Zero significant label mismatches in every case. The fp32 paths land ~35×
+inside their tolerance and fp16 ~40× inside its own, so the thresholds are not
+doing any work here — the kernels simply agree with double precision.
+
+fp16 is better than expected. Accumulating in fp32 while storing in fp16 costs
+about 1e-4 rad, which is three orders of magnitude below any sensible detection
+threshold.
+
+### Host side
 
 The ENVI read and the CPU reference were cross-checked against an independent
 numpy implementation on real HyperBlood cubes:
@@ -108,33 +50,143 @@ numpy implementation on real HyperBlood cubes:
 | angle map vs float64 numpy SAM | max 6.5e-7 rad, mean 1.1e-7 rad |
 | winning target index           | 0 disagreements in 361 224 pixels |
 
-That fixes the reference the GPU is measured against to real data rather than
-to itself.
+## Kernel throughput
 
-### GPU, to be filled from `correctness_*.txt`
+512×512×128 (134.2 MB), 4 targets, RTX 3090:
 
-Every variant is compared against the double-precision CPU reference. The
-tolerance is 2e-3 rad for the fp32 paths and 5e-3 rad for fp16; both are
-reported in the output rather than assumed.
+| variant | ms | GB/s | % of peak | vs baseline |
+|---------|---:|-----:|----------:|------------:|
+| `baseline`  | 0.650 | 825.5 | 88% | 1.00× |
+| `optimized` | 0.164 | 819.3 | 88% | **3.97×** |
+| `half`      | 0.098 | 684.3 | 73% | **6.63×** |
+| `bip`       | 1.836 | 292.4 | 31% | 0.35× |
 
-| device | variant | max angle error (rad) | significant label mismatches | verdict |
-|--------|---------|----------------------:|-----------------------------:|---------|
-| | `baseline`  | | | |
-| | `optimized` | | | |
-| | `half`      | | | |
-| | `bip`       | | | |
+BIP→BSQ transpose: 0.421 ms at 636.9 GB/s counting read and write.
 
-A label mismatch is only counted when the two candidate targets were
-meaningfully apart. Where two sit at nearly the same angle from a pixel, which
-one wins is decided by the last bit of the accumulation.
+### Scaling with target count
+
+The number that decides whether amortising the cube read across targets works.
+`optimized` and `half` hold roughly constant while `baseline` scales linearly,
+because its target loop is outermost and re-reads the cube every time.
+
+| targets | baseline | optimized | half | opt speedup | opt % of peak |
+|--------:|---------:|----------:|-----:|------------:|--------------:|
+|  1 | 0.161 | 0.158 | 0.095 | 1.02× | 91% |
+|  2 | 0.319 | 0.161 | 0.098 | 1.99× | 89% |
+|  4 | 0.653 | 0.164 | 0.098 | 3.98× | 87% |
+|  8 | 1.317 | 0.277 | 0.192 | 4.76× | **52%** |
+| 16 | 2.642 | 0.531 | 0.384 | 4.97× | **54%** |
+
+### Scaling with band count
+
+| bands | MB | baseline | optimized | half | bip | opt % of peak |
+|------:|---:|---------:|----------:|-----:|----:|--------------:|
+|  16 |  16.8 | 0.037 | 0.029 | 0.024 | 0.065 | 62% |
+|  32 |  33.6 | 0.158 | 0.047 | 0.035 | 0.331 | 76% |
+|  64 |  67.1 | 0.318 | 0.088 | 0.059 | 0.871 | 82% |
+| 113 | 118.5 | 0.575 | 0.149 | 0.093 | 2.201 | 85% |
+| 128 | 134.2 | 0.653 | 0.164 | 0.099 | 1.813 | 87% |
+| 224 | 234.9 | 1.166 | 0.278 | 0.158 | 7.133 | 90% |
+
+At 16 bands the harness reports `baseline` at **193% of peak**, which is
+impossible and marks the whole row as invalid: at 0.037 ms the kernel is short
+enough that launch overhead and L2 residency dominate the measurement. Treat
+anything under about 30 MB per frame as unmeasured rather than fast. That
+includes the HOT VIS geometry (256×512×16 = 8.4 MB), so the per-frame figures
+predicted for it earlier in this project mean nothing.
 
 ## Pipeline, end to end
 
-_To be filled from `pipeline.txt` and `memory_mode.txt`._
+512×512×128, 4 targets, 3 streams, `--memory=copy`, 200 frames prefilled:
 
-| device | memory | variant | fps | p50 ms | p99 ms | upload ms | sam ms | detect ms |
-|--------|--------|---------|----:|-------:|-------:|----------:|-------:|----------:|
-| | | | | | | | | |
+| variant | fps | p50 ms | p99 ms | upload | sam | detect | download |
+|---------|----:|-------:|-------:|-------:|----:|-------:|---------:|
+| `baseline`  | 79.9 | 37.46 | 38.39 | 36.61 | 0.671 | 0.023 | 0.029 |
+| `optimized` | 79.7 | 37.65 | 39.18 | 37.19 | 0.182 | 0.022 | 0.030 |
+| `half`      | 80.6 | 37.17 | 37.96 | 36.61 | 0.351 | 0.021 | 0.028 |
+
+**The pipeline is PCIe-bound and the kernel is invisible.** Upload is 36.6 ms
+against 0.18 ms of SAM — the kernel is 0.5% of the frame. All three variants
+land within 1% of each other because none of them touches the bottleneck.
+
+Aggregate throughput of 80 fps × 134.2 MB is 10.7 GB/s, which is a PCIe Gen3
+×16 link running flat out. Nothing above the link can help.
+
+### Streams
+
+| streams | fps | p50 ms |
+|--------:|----:|-------:|
+| 1 | 82.7 | 11.99 |
+| 2 | 84.7 | 23.55 |
+| 3 | 80.8 | 37.09 |
+| 4 | 75.9 | 52.80 |
+| 6 | 77.8 | 51.38 |
+
+Throughput is flat and latency grows linearly with stream count — the signature
+of one serialised resource. Extra streams queue behind the same copy engine
+instead of overlapping with anything. **On a discrete GPU `--streams=1` is
+strictly better**: same throughput at a third of the latency. The default of 3
+is wrong for this path and is only likely to pay off on the Orin, where there
+is no copy to serialise on.
+
+## The predictions, scored
+
+Written down in this file before any of them were measured.
+
+| # | prediction | verdict |
+|---|------------|---------|
+| 1 | zero-copy cuts memory traffic ~3× on Orin | **untested** — needs the Orin |
+| 2 | `optimized` approaches 8× over `baseline` at 8 targets | **falsified** — 4.8× |
+| 3 | BIP costs ~8× in load efficiency | **partial** — 31% vs 88% of peak achieved; the sector metric needs `ncu` |
+| 4 | fp16 ≈2× at the kernel, ≈nothing end to end | **confirmed**, both halves |
+
+**Why 2 failed.** The speedup tracks target count cleanly to 4× and then stops.
+The cause is in the `% of peak` column: `optimized` holds 87–91% up to four
+targets and falls to 52% at eight. Eight targets × four pixels is 32 live
+accumulator registers, and that is past the occupancy knee on sm_86 — the
+kernel stops having enough warps resident to keep the memory pipe full. The
+design notes flagged 32 registers as "about where occupancy starts to pay for
+further widening"; it turns out to be slightly past that, not at it.
+
+The dispatch choice is still right. At 8 targets, one TT=8 pass at 0.277 ms
+beats two TT=4 passes at 2 × 0.164 = 0.328 ms. The obvious experiment is TT=8
+with two pixels per thread instead of four, which halves the accumulators.
+
+**Why 3 is only partial.** `ncu` returned `ERR_NVGPUCTRPERM` — the rented
+container blocks performance counters, so the per-sector load-efficiency metric
+was never collected. What the wall clock does say is that `bip` achieves 31% of
+peak against `optimized`'s 88%, about 2.8× worse, and that it degrades with
+band count (32% at 128 bands, 14% at 224) as the stride grows. That is
+consistent with the predicted cause without confirming the mechanism.
+
+**Why 4 confirmed.** 1.66× at the kernel rather than a clean 2×, because `half`
+only reaches 73–79% of peak against `optimized`'s 87–91% — half the bytes, but
+less work in flight per thread to hide latency with. End to end it is 80.6 fps
+against 79.7, which is noise, exactly as predicted for an fp32 source.
+
+### Two things nobody predicted
+
+**The baseline was already at the roofline.** It runs at 87–90% of peak at
+every band count. At one target `optimized` beats it by 1.02× — float4 loads
+and constant-memory broadcast together buy **2%**. The entire 4–5× win is
+amortising the cube read across targets, and nothing else. Coalescing is what
+matters; vectorising on top of already-coalesced access does almost nothing.
+
+**Small frames cannot be measured this way.** The 193%-of-peak row is a warning
+about the harness, not a result about the kernel.
+
+## What the Orin still has to answer
+
+Everything above is a discrete GPU behind a PCIe link, which is the
+configuration this project was *not* built for. The measurements that only
+exist on the Orin:
+
+* whether zero-copy removes the upload stage entirely, as designed
+* whether, with the copy gone, the variant choice becomes visible end to end —
+  on this box it was buried under a 36 ms transfer
+* whether more than one stream helps once there is no copy engine to serialise
+  on
+* what fraction of a 40 ms frame budget is left after detection
 
 ## Detection quality on HyperBlood
 
