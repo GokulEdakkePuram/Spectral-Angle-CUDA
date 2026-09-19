@@ -1,16 +1,11 @@
 add_executable(bench_sam bench_sam.cu)
 target_link_libraries(bench_sam PRIVATE hsi_cuda)
 
-# NVML reports the current SM clock, which the benchmark prints beside every
-# timing. Without it a throttled result is indistinguishable from a slow
-# kernel. It is optional because Tegra's NVML support has historically been
-# partial, and the benchmark degrades to printing 0.
-if(TARGET CUDA::nvml)
-  target_link_libraries(bench_sam PRIVATE CUDA::nvml)
-  target_compile_definitions(bench_sam PRIVATE HSI_HAVE_NVML=1)
-else()
-  message(STATUS "NVML not found - bench_sam will not report SM clock")
-endif()
+# NVML is dlopen'd at runtime rather than linked, so only libdl is needed here.
+# Linking CUDA::nvml would require nvml.h and the libnvidia-ml.so symlink, which
+# live in a dev package that container images and JetPack images often omit even
+# though the driver library itself is present.
+target_link_libraries(bench_sam PRIVATE ${CMAKE_DL_LIBS})
 
 # The benchmark doubles as the GPU correctness test: --check-only compares
 # every variant against the CPU reference and exits non-zero on disagreement.

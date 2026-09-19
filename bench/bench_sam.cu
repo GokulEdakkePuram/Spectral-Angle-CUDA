@@ -10,8 +10,8 @@
 //      that says how close to the hardware's ceiling the kernel actually is.
 
 #include <cuda_runtime.h>
-#if HSI_HAVE_NVML
-#include <nvml.h>
+#if defined(__unix__)
+#include <dlfcn.h>
 #endif
 
 #include <algorithm>
@@ -89,27 +89,47 @@ Options parse(int argc, char** argv) {
   return options;
 }
 
-/// Current SM clock in MHz, or 0 if NVML is unavailable.
+/// Current SM clock in MHz, or 0 if it cannot be read.
 ///
 /// Printed beside every timing because a throttled result is otherwise
-/// indistinguishable from a slow kernel. On a card whose power limit is well
-/// under its board maximum the SM clock can fall by more than 2x under
-/// sustained load while the memory clock does not move at all — which changes
-/// memory-bound and SM-bound kernels by very different amounts.
+/// indistinguishable from a slow kernel. On a card whose power limit sits below
+/// its board maximum the SM clock can fall by more than 2x under sustained load
+/// while the memory clock does not move at all — which changes memory-bound and
+/// SM-bound kernels by very different amounts.
+///
+/// NVML is loaded with dlopen rather than linked. The driver installs
+/// libnvidia-ml.so.1 wherever it is installed, but nvml.h and the .so
+/// development symlink come from a separate package that container images
+/// routinely omit. dlopen needs neither, and returns 0 when the library is
+/// genuinely absent.
 unsigned current_sm_clock_mhz() {
-#if HSI_HAVE_NVML
-  static const bool ready = (nvmlInit_v2() == NVML_SUCCESS);
+#if defined(__unix__)
+  using InitFn = int (*)();
+  using HandleFn = int (*)(unsigned, void**);
+  using ClockFn = int (*)(void*, int, unsigned*);
+
+  static HandleFn get_handle = nullptr;
+  static ClockFn get_clock = nullptr;
+  static const bool ready = [] {
+    void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    if (!lib) lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+    if (!lib) return false;
+    const auto init = reinterpret_cast<InitFn>(dlsym(lib, "nvmlInit_v2"));
+    get_handle = reinterpret_cast<HandleFn>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+    get_clock = reinterpret_cast<ClockFn>(dlsym(lib, "nvmlDeviceGetClockInfo"));
+    return init && get_handle && get_clock && init() == 0;
+  }();
   if (!ready) return 0;
+
   int ordinal = 0;
   if (cudaGetDevice(&ordinal) != cudaSuccess) return 0;
-  nvmlDevice_t device;
+  void* device = nullptr;
   // NVML indices track CUDA ordinals only when CUDA_VISIBLE_DEVICES is unset;
   // good enough for a single-GPU benchmark, and 0 on any mismatch.
-  if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(ordinal), &device) != NVML_SUCCESS) {
-    return 0;
-  }
+  if (get_handle(static_cast<unsigned>(ordinal), &device) != 0) return 0;
   unsigned mhz = 0;
-  if (nvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &mhz) != NVML_SUCCESS) return 0;
+  constexpr int kNvmlClockSm = 1;  // NVML_CLOCK_SM
+  if (get_clock(device, kNvmlClockSm, &mhz) != 0) return 0;
   return mhz;
 #else
   return 0;
@@ -408,7 +428,9 @@ int main(int argc, char** argv) {
   }
 
   if (first_clock == 0) {
-    std::printf("\nSM MHz reads 0: NVML unavailable, so throttling is invisible here.\n");
+    std::printf(
+        "\nSM MHz reads 0: libnvidia-ml.so.1 could not be loaded, so throttling\n"
+        "is invisible here. Compare only rows from one run.\n");
   } else if (props.clockRate > 0 &&
              first_clock < static_cast<unsigned>(props.clockRate / 1000) * 3 / 4) {
     std::printf(
