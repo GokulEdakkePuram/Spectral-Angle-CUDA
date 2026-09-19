@@ -224,12 +224,21 @@ Timing time_variant(hsi::SamVariant variant, const Buffers& buffers,
   CUDA_OK(cudaEventCreate(&end));
 
   std::vector<float> samples;
+  std::vector<unsigned> clocks;
   const int passes = std::max(1, repeats);
   samples.reserve(static_cast<std::size_t>(passes));
+  clocks.reserve(static_cast<std::size_t>(passes));
   for (int r = 0; r < passes; ++r) {
     CUDA_OK(cudaEventRecord(begin));
     for (int i = 0; i < iterations; ++i) launch();
     CUDA_OK(cudaEventRecord(end));
+
+    // Sample the clock here, with the launches queued and running, rather than
+    // after the synchronise below. Reading it once the GPU has gone idle
+    // catches it ramping back towards boost, which is the opposite of the
+    // number wanted and reports a throttled kernel as a fast-clocked one.
+    clocks.push_back(current_sm_clock_mhz());
+
     CUDA_OK(cudaEventSynchronize(end));
     float ms = 0;
     CUDA_OK(cudaEventElapsedTime(&ms, begin, end));
@@ -241,11 +250,12 @@ Timing time_variant(hsi::SamVariant variant, const Buffers& buffers,
   // Median, not mean: one pass that happened to catch a clock transition
   // should not drag the reported figure.
   std::sort(samples.begin(), samples.end());
+  std::sort(clocks.begin(), clocks.end());
   Timing timing;
   timing.median_ms = samples[samples.size() / 2];
   timing.min_ms = samples.front();
   timing.max_ms = samples.back();
-  timing.sm_mhz = current_sm_clock_mhz();
+  timing.sm_mhz = clocks.empty() ? 0 : clocks[clocks.size() / 2];
   return timing;
 }
 
