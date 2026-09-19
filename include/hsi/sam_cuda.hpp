@@ -83,11 +83,17 @@ cudaError_t upload_targets(const float* values, const float* norms,
 /// A single acosf runs per pixel, not per target: the kernel ranks targets on
 /// cosine, which is monotonically decreasing in the angle, and converts once
 /// at the end.
+/// `opt_pixels_per_thread` selects how many pixels one thread of the Optimized
+/// kernel handles: 2, 4 (the default) or 8. It exists because measurements on
+/// sm_86 put the TT=8 bandwidth cliff on the ratio of constant-memory reads to
+/// vector loads per band step, not on register pressure, and this is the knob
+/// that varies that ratio. Ignored by the other variants.
 cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
                             CubeShape shape, const float* d_targets,
                             const float* d_target_norms, int num_targets,
                             float* d_angle_rad, std::int32_t* d_target_id,
-                            cudaStream_t stream);
+                            cudaStream_t stream,
+                            int opt_pixels_per_thread = 0);
 
 /// Transpose a BIP cube into BSQ on the device.
 ///

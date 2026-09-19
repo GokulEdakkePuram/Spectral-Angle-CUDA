@@ -44,6 +44,8 @@ struct Options {
   int warmup = 20;
   bool check_only = false;
   double tolerance = 2e-3;  ///< radians
+  /// Pixels per thread for the Optimized kernel: 2, 4 or 8. 0 sweeps all three.
+  int opt_pixels = 0;
 };
 
 Options parse(int argc, char** argv) {
@@ -60,11 +62,14 @@ Options parse(int argc, char** argv) {
     else if (key == "--iterations") options.iterations = std::stoi(value);
     else if (key == "--warmup") options.warmup = std::stoi(value);
     else if (key == "--tolerance") options.tolerance = std::stod(value);
+    else if (key == "--opt-pixels") options.opt_pixels = std::stoi(value);
     else if (key == "--check-only") options.check_only = true;
     else if (key == "--help") {
       std::puts(
           "bench_sam [--height=N --width=N --bands=N --targets=N]\n"
-          "          [--iterations=N --warmup=N --tolerance=RAD --check-only]");
+          "          [--iterations=N --warmup=N --tolerance=RAD --check-only]\n"
+          "          [--opt-pixels=2|4|8]   pixels per thread for `optimized`;\n"
+          "                                 omit to time all three");
       std::exit(0);
     }
   }
@@ -118,7 +123,8 @@ Agreement compare(const std::vector<float>& gpu_angle,
 }
 
 float time_variant(hsi::SamVariant variant, const Buffers& buffers,
-                   hsi::CubeShape shape, int targets, int iterations, int warmup) {
+                   hsi::CubeShape shape, int targets, int iterations, int warmup,
+                   int opt_pixels = 0) {
   const void* cube = (variant == hsi::SamVariant::BipDirect) ? static_cast<const void*>(buffers.d_bip)
                      : (variant == hsi::SamVariant::Half)    ? buffers.d_half
                                                              : static_cast<const void*>(buffers.d_bsq);
@@ -126,7 +132,7 @@ float time_variant(hsi::SamVariant variant, const Buffers& buffers,
   for (int i = 0; i < warmup; ++i) {
     CUDA_OK(hsi::launch_sam_best(variant, cube, shape, buffers.d_targets,
                                  buffers.d_norms, targets, buffers.d_angle,
-                                 buffers.d_target_id, nullptr));
+                                 buffers.d_target_id, nullptr, opt_pixels));
   }
   CUDA_OK(cudaDeviceSynchronize());
 
@@ -137,7 +143,7 @@ float time_variant(hsi::SamVariant variant, const Buffers& buffers,
   for (int i = 0; i < iterations; ++i) {
     CUDA_OK(hsi::launch_sam_best(variant, cube, shape, buffers.d_targets,
                                  buffers.d_norms, targets, buffers.d_angle,
-                                 buffers.d_target_id, nullptr));
+                                 buffers.d_target_id, nullptr, opt_pixels));
   }
   CUDA_OK(cudaEventRecord(end));
   CUDA_OK(cudaEventSynchronize(end));
@@ -252,7 +258,7 @@ int main(int argc, char** argv) {
     CUDA_OK(cudaMemset(buffers.d_target_id, 0xff, pixels * sizeof(std::int32_t)));
     CUDA_OK(hsi::launch_sam_best(variant, cube, shape, buffers.d_targets,
                                  buffers.d_norms, library.size(), buffers.d_angle,
-                                 buffers.d_target_id, nullptr));
+                                 buffers.d_target_id, nullptr, options.opt_pixels));
     CUDA_OK(cudaDeviceSynchronize());
 
     std::vector<float> gpu_angle(pixels);
@@ -297,7 +303,8 @@ int main(int argc, char** argv) {
   float baseline_ms = 0;
   for (hsi::SamVariant variant : variants) {
     const float ms = time_variant(variant, buffers, shape, library.size(),
-                                  options.iterations, options.warmup);
+                                  options.iterations, options.warmup,
+                                  options.opt_pixels);
     if (variant == hsi::SamVariant::Baseline) baseline_ms = ms;
 
     // Bytes the kernel must read from DRAM. The baseline re-reads the cube
@@ -320,6 +327,32 @@ int main(int argc, char** argv) {
                 peak_gbs > 0 ? 100.0 * gbs / peak_gbs : 0.0,
                 static_cast<double>(pixels) / (ms * 1.0e-3) / 1.0e9,
                 baseline_ms > 0 ? baseline_ms / ms : 1.0);
+  }
+
+  // Pixels per thread for `optimized`, which changes how many constant-memory
+  // reads ride on each vector load. At TT=8 that ratio is 8:1 at four pixels
+  // and 4:1 at eight, and the sm_86 measurements say the ratio is what costs
+  // the bandwidth - so this sweep is the experiment, not a tuning knob.
+  if (options.opt_pixels == 0) {
+    std::printf("\noptimized, pixels per thread (constant reads per vector load)\n");
+    std::printf("%10s %10s %10s %10s %14s\n", "px/thread", "ms", "GB/s",
+                "% of peak", "const/16B ld");
+    std::printf("%s\n", std::string(60, '-').c_str());
+    const int per_pass = std::min(library.size(), 8);
+    for (int ppt : {2, 4, 8}) {
+      const float ms = time_variant(hsi::SamVariant::Optimized, buffers, shape,
+                                    library.size(), options.iterations,
+                                    options.warmup, ppt);
+      const int passes = (library.size() + 7) / 8;
+      const double bytes = static_cast<double>(shape.elements()) * 4.0 * passes;
+      const double gbs = bytes / (ms * 1.0e-3) / 1.0e9;
+      // Constant-memory reads per 16 bytes loaded: TT reads ride on PPT/4 of
+      // a float4, so two pixels per thread doubles the ratio and eight halves
+      // it. This is the quantity the cliff tracks.
+      std::printf("%10d %10.3f %10.1f %9.0f%% %14.1f\n", ppt, ms, gbs,
+                  peak_gbs > 0 ? 100.0 * gbs / peak_gbs : 0.0,
+                  per_pass / (ppt / 4.0));
+    }
   }
 
   // The transpose that a BIP-delivering camera would need before the fast path.

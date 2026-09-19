@@ -123,47 +123,63 @@ __global__ void sam_bip_kernel(const float* __restrict__ cube, int bands,
 // is safe because acos is monotonically decreasing, and it buys back all but
 // one of the transcendentals.
 // ---------------------------------------------------------------------------
-template <int TT>
+template <int TT, int PPT>
 __global__ void sam_opt_kernel(const float* __restrict__ cube, int bands,
                                std::size_t pixels, std::size_t stride,
                                int t_base, bool first, bool last,
                                float* __restrict__ out_angle,
                                int* __restrict__ out_target) {
-  const std::size_t quad = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  const std::size_t p0 = quad * kQuad;
+  static_assert(PPT == 2 || PPT == 4 || PPT == 8, "PPT must be 2, 4 or 8");
+
+  const std::size_t group = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  const std::size_t p0 = group * PPT;
   if (p0 >= pixels) return;
 
-  float dot[TT][kQuad];
+  float dot[TT][PPT];
 #pragma unroll
   for (int t = 0; t < TT; ++t)
 #pragma unroll
-    for (int k = 0; k < kQuad; ++k) dot[t][k] = 0.0f;
+    for (int k = 0; k < PPT; ++k) dot[t][k] = 0.0f;
 
-  float nrm[kQuad] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-  const float4* cube4 = reinterpret_cast<const float4*>(cube);
-  const std::size_t stride4 = stride / kQuad;
+  float nrm[PPT];
+#pragma unroll
+  for (int k = 0; k < PPT; ++k) nrm[k] = 0.0f;
 
   for (int b = 0; b < bands; ++b) {
-    // The cube is the only thing streaming from DRAM; everything else in this
-    // loop is a constant-memory broadcast or a register FMA.
-    const float4 v = cube4[static_cast<std::size_t>(b) * stride4 + quad];
-    nrm[0] = fmaf(v.x, v.x, nrm[0]);
-    nrm[1] = fmaf(v.y, v.y, nrm[1]);
-    nrm[2] = fmaf(v.z, v.z, nrm[2]);
-    nrm[3] = fmaf(v.w, v.w, nrm[3]);
+    const float* plane = cube + static_cast<std::size_t>(b) * stride;
+
+    // One vector load per PPT pixels. The plane stride is padded to eight
+    // elements, so every one of these stays aligned on every band.
+    float v[PPT];
+    if constexpr (PPT == 2) {
+      const float2 a = reinterpret_cast<const float2*>(plane)[group];
+      v[0] = a.x; v[1] = a.y;
+    } else if constexpr (PPT == 4) {
+      const float4 a = reinterpret_cast<const float4*>(plane)[group];
+      v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+    } else {
+      const float4 a = reinterpret_cast<const float4*>(plane)[group * 2];
+      const float4 c = reinterpret_cast<const float4*>(plane)[group * 2 + 1];
+      v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+      v[4] = c.x; v[5] = c.y; v[6] = c.z; v[7] = c.w;
+    }
+
+#pragma unroll
+    for (int k = 0; k < PPT; ++k) nrm[k] = fmaf(v[k], v[k], nrm[k]);
+
+    // TT reads of constant memory per band step, against PPT/4 vector loads.
+    // That ratio is what the measurements point at, so it is the thing PPT
+    // exists to vary.
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
       const float r = c_targets[static_cast<std::size_t>(t_base + t) * bands + b];
-      dot[t][0] = fmaf(v.x, r, dot[t][0]);
-      dot[t][1] = fmaf(v.y, r, dot[t][1]);
-      dot[t][2] = fmaf(v.z, r, dot[t][2]);
-      dot[t][3] = fmaf(v.w, r, dot[t][3]);
+#pragma unroll
+      for (int k = 0; k < PPT; ++k) dot[t][k] = fmaf(v[k], r, dot[t][k]);
     }
   }
 
 #pragma unroll
-  for (int k = 0; k < kQuad; ++k) {
+  for (int k = 0; k < PPT; ++k) {
     const std::size_t p = p0 + k;
     if (p >= pixels) continue;
 
@@ -356,7 +372,7 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
                             CubeShape shape, const float* d_targets,
                             const float* d_target_norms, int num_targets,
                             float* d_angle_rad, std::int32_t* d_target_id,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, int opt_pixels_per_thread) {
   if (!shape.valid() || num_targets <= 0) return cudaErrorInvalidValue;
 
   const std::size_t pixels = shape.pixels();
@@ -381,8 +397,11 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
       return cudaGetLastError();
     }
     case SamVariant::Optimized: {
-      const std::size_t quads = div_up(pixels, kQuad);
-      const std::size_t blocks = div_up(quads, kBlock);
+      const int ppt = (opt_pixels_per_thread == 2 || opt_pixels_per_thread == 8)
+                          ? opt_pixels_per_thread
+                          : kQuad;
+      const std::size_t groups = div_up(pixels, static_cast<std::size_t>(ppt));
+      const std::size_t blocks = div_up(groups, kBlock);
       int done = 0;
       while (done < num_targets) {
         const int remaining = num_targets - done;
@@ -390,14 +409,21 @@ cudaError_t launch_sam_best(SamVariant variant, const void* d_cube,
                        : (remaining >= 2) ? 2 : 1;
         const bool first = (done == 0);
         const bool last = (done + tt >= num_targets);
-#define HSI_LAUNCH_OPT(N)                                                     \
-  sam_opt_kernel<N><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(     \
-      static_cast<const float*>(d_cube), shape.bands, pixels, stride, done,    \
+#define HSI_LAUNCH_OPT(N, P)                                                   \
+  sam_opt_kernel<N, P><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(   \
+      static_cast<const float*>(d_cube), shape.bands, pixels, stride, done,     \
       first, last, d_angle_rad, out_target)
-        if (tt == 8) HSI_LAUNCH_OPT(8);
-        else if (tt == 4) HSI_LAUNCH_OPT(4);
-        else if (tt == 2) HSI_LAUNCH_OPT(2);
-        else HSI_LAUNCH_OPT(1);
+#define HSI_LAUNCH_OPT_TT(P)                                                   \
+  do {                                                                         \
+    if (tt == 8) HSI_LAUNCH_OPT(8, P);                                          \
+    else if (tt == 4) HSI_LAUNCH_OPT(4, P);                                     \
+    else if (tt == 2) HSI_LAUNCH_OPT(2, P);                                     \
+    else HSI_LAUNCH_OPT(1, P);                                                  \
+  } while (0)
+        if (ppt == 2) HSI_LAUNCH_OPT_TT(2);
+        else if (ppt == 8) HSI_LAUNCH_OPT_TT(8);
+        else HSI_LAUNCH_OPT_TT(4);
+#undef HSI_LAUNCH_OPT_TT
 #undef HSI_LAUNCH_OPT
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return err;
