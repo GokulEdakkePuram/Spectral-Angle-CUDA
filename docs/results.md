@@ -332,7 +332,7 @@ that at a fixed operating point. F_1 goes from 0.694 AUC with the global
 signature to 0.9945 with its own, and its precision at 0.10 rad from 0.34 to
 1.00.
 
-### F_1 in detail — blood against five red lookalikes
+### F_1 in detail — blood against six red lookalikes
 
 The case this dataset exists for: blood alongside ketchup, artificial blood,
 beetroot juice, poster paint, tomato concentrate and acrylic paint, all red,
